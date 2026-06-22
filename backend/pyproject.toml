@@ -28,6 +28,7 @@ dependencies = [
     "cryptography",
     "passlib[bcrypt]",
     "structlog",
+    "playwright",
 ]
 
 [project.optional-dependencies]

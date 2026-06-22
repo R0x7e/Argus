@@ -96,6 +96,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         except Exception as e:
             logger.warning(f"事件总线绑定 NATS 失败: {e}")
 
+    # 初始化 Playwright 浏览器
+    try:
+        from app.core.playwright_manager import init_playwright
+        proxy_url = settings.MITMPROXY_URL.replace("http://", "")
+        await init_playwright(proxy_url=f"http://{proxy_url}")
+        logger.info("Playwright 浏览器已初始化")
+    except Exception as e:
+        logger.warning(f"Playwright 初始化失败（浏览器工具不可用）: {e}")
+
+    # 初始化代理流量消费者
+    try:
+        from app.core.proxy_client import start_consumer
+        await start_consumer()
+        logger.info("ProxyFlowConsumer 已启动")
+    except Exception as e:
+        logger.warning(f"ProxyFlowConsumer 启动失败（流量工具不可用）: {e}")
+
     # 初始化 Agent 运行器
     runner = AgentRunner(session_factory=async_session_factory)
     agent_runner_module.agent_runner = runner
@@ -106,6 +123,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # === 关闭阶段 ===
     logger.info("正在关闭 Argus 服务...")
+
+    # 关闭 Playwright
+    try:
+        from app.core.playwright_manager import close_playwright
+        await close_playwright()
+        logger.info("Playwright 已关闭")
+    except Exception as e:
+        logger.warning(f"Playwright 关闭异常: {e}")
+
+    # 停止代理流量消费者
+    try:
+        from app.core.proxy_client import stop_consumer
+        await stop_consumer()
+        logger.info("ProxyFlowConsumer 已停止")
+    except Exception as e:
+        logger.warning(f"ProxyFlowConsumer 停止异常: {e}")
 
     # 关闭 NATS
     try:

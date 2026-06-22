@@ -25,6 +25,11 @@ from .payload_mutator import PayloadMutatorTool
 from .sql_injection import SQLInjectionTool
 from .ssrf_detector import SSRFDetectorTool
 from .auth_tester import AuthTesterTool
+from .browser_request import BrowserRequestTool
+from .browser_interact import BrowserInteractTool
+from .proxy_flows import ProxyFlowsTool
+from .deep_crawl import DeepCrawlTool
+from .run_poc import RunPocTool
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +49,11 @@ def _register_all_tools() -> None:
         SQLInjectionTool(),       # L1: SQL 注入检测
         SSRFDetectorTool(),       # L1: SSRF 检测
         AuthTesterTool(),         # L1: 越权检测
+        BrowserRequestTool(),    # L1: 浏览器渲染
+        BrowserInteractTool(),   # L2: 浏览器交互
+        ProxyFlowsTool(),        # L0: 代理流量查询
+        DeepCrawlTool(),         # L0: 深度爬虫
+        RunPocTool(),            # L2: PoC 沙箱执行
     ]
 
     for tool in tools:
@@ -74,6 +84,11 @@ __all__ = [
     "SQLInjectionTool",
     "SSRFDetectorTool",
     "AuthTesterTool",
+    "BrowserRequestTool",
+    "BrowserInteractTool",
+    "ProxyFlowsTool",
+    "DeepCrawlTool",
+    "RunPocTool",
     # 全局注册中心
     "tool_registry",
 ]

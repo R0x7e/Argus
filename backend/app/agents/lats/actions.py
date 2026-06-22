@@ -42,6 +42,13 @@ class ActionType(str, Enum):
     REPORT_FINDING = "report_finding"
     GIVE_UP = "give_up"
 
+    # 浏览器 & 高级侦察类
+    RENDER_PAGE = "render_page"
+    INTERACT_PAGE = "interact_page"
+    DEEP_CRAWL = "deep_crawl"
+    ANALYZE_TRAFFIC = "analyze_traffic"
+    RUN_POC = "run_poc"
+
 
 @dataclass
 class Observation:
@@ -136,6 +143,16 @@ async def execute_action(
             return await _execute_extract_data(params, context, tool_registry)
         elif action in (ActionType.BACKTRACK, ActionType.REPORT_FINDING, ActionType.GIVE_UP):
             return Observation(success=True, summary=f"控制动作: {action.value}")
+        elif action == ActionType.RENDER_PAGE:
+            return await _execute_render_page(params, context, tool_registry)
+        elif action == ActionType.INTERACT_PAGE:
+            return await _execute_interact_page(params, context, tool_registry)
+        elif action == ActionType.DEEP_CRAWL:
+            return await _execute_deep_crawl(params, context, tool_registry)
+        elif action == ActionType.ANALYZE_TRAFFIC:
+            return await _execute_analyze_traffic(params, context, tool_registry)
+        elif action == ActionType.RUN_POC:
+            return await _execute_run_poc(params, context, tool_registry)
         else:
             return Observation(success=False, summary=f"动作 {action.value} 尚未实现")
     except Exception as e:
@@ -663,4 +680,185 @@ async def _execute_extract_data(params: dict, context: ExecutionContext, registr
         new_info_gained=len(body) > 100,
         new_facts=[f"提取数据 {len(body)} bytes"] if len(body) > 100 else [],
         tool_call={"tool": "http_request", "params": req_params, "result": {"status": status, "len": len(body)}},
+    )
+
+
+async def _execute_render_page(params: dict, context: ExecutionContext, registry) -> Observation:
+    """使用 Playwright 渲染页面，提取 JS 动态内容"""
+    url = params.get("url", "")
+    if not url:
+        return Observation(success=False, summary="render_page 缺少 url")
+
+    tool = registry.get("browser_request")
+    result = await tool.execute({
+        "url": url,
+        "wait_for": params.get("wait_for", "networkidle"),
+        "extract_links": True,
+        "extract_forms": True,
+    }, context)
+
+    if not result.get("success"):
+        return Observation(success=False, summary=f"渲染失败: {result.get('error', '')}")
+
+    links = result.get("links", [])
+    forms = result.get("forms", [])
+    new_facts = []
+    if links:
+        new_facts.append(f"JS 渲染发现 {len(links)} 个链接")
+    if forms:
+        new_facts.append(f"JS 渲染发现 {len(forms)} 个表单")
+
+    return Observation(
+        success=True,
+        summary=f"渲染完成: links={len(links)}, forms={len(forms)}",
+        response_body=result.get("content_snippet", "")[:2000],
+        new_info_gained=bool(links or forms),
+        new_facts=new_facts,
+        tool_call={"tool": "browser_request", "params": {"url": url}, "result": {"links": links[:20], "forms": forms}},
+    )
+
+
+async def _execute_interact_page(params: dict, context: ExecutionContext, registry) -> Observation:
+    """浏览器交互 — 填写表单、点击、捕获请求"""
+    url = params.get("url", "")
+    actions = params.get("actions", [])
+    if not url or not actions:
+        return Observation(success=False, summary="interact_page 缺少 url 或 actions")
+
+    tool = registry.get("browser_interact")
+    result = await tool.execute({
+        "url": url,
+        "actions": actions,
+        "capture_requests": True,
+    }, context)
+
+    if not result.get("success"):
+        return Observation(success=False, summary=f"交互失败: {result.get('error', '')}")
+
+    captured = result.get("captured_requests", [])
+    action_results = result.get("action_results", [])
+    new_facts = []
+    if captured:
+        new_facts.append(f"交互产生 {len(captured)} 个网络请求")
+        api_calls = [r for r in captured if "/api/" in r.get("url", "")]
+        if api_calls:
+            new_facts.append(f"发现隐藏 API 调用: {[r['url'][:80] for r in api_calls[:5]]}")
+
+    return Observation(
+        success=True,
+        summary=f"交互完成: {len(action_results)} actions, {len(captured)} requests captured",
+        response_body=result.get("final_content_snippet", "")[:1500],
+        new_info_gained=bool(captured),
+        new_facts=new_facts,
+        tool_call={"tool": "browser_interact", "params": {"url": url}, "result": {"captured": captured[:10]}},
+    )
+
+
+async def _execute_deep_crawl(params: dict, context: ExecutionContext, registry) -> Observation:
+    """crawlergo 深度爬取"""
+    url = params.get("url", "")
+    if not url:
+        return Observation(success=False, summary="deep_crawl 缺少 url")
+
+    tool = registry.get("deep_crawl")
+    result = await tool.execute({
+        "url": url,
+        "max_count": params.get("max_count", 500),
+        "timeout": params.get("timeout", 120),
+    }, context)
+
+    if not result.get("success"):
+        return Observation(success=False, summary=f"深度爬取失败: {result.get('error', '')}")
+
+    urls = result.get("urls", [])
+    forms = result.get("forms", [])
+    parameters = result.get("parameters", [])
+    new_facts = []
+    if urls:
+        new_facts.append(f"深度爬取发现 {len(urls)} 个 URL")
+    if forms:
+        new_facts.append(f"深度爬取发现 {len(forms)} 个表单")
+    if parameters:
+        new_facts.append(f"深度爬取发现 {len(parameters)} 个参数")
+
+    return Observation(
+        success=True,
+        summary=f"深度爬取: urls={len(urls)}, forms={len(forms)}, params={len(parameters)}",
+        new_info_gained=bool(urls or forms or parameters),
+        new_facts=new_facts,
+        tool_call={"tool": "deep_crawl", "params": {"url": url}, "result": {"urls": urls[:20], "forms": forms[:5]}},
+    )
+
+
+async def _execute_analyze_traffic(params: dict, context: ExecutionContext, registry) -> Observation:
+    """分析 mitmproxy 捕获的流量"""
+    tool = registry.get("proxy_flows")
+    result = await tool.execute({
+        "filter_host": params.get("filter_host", ""),
+        "filter_path": params.get("filter_path", ""),
+        "filter_method": params.get("filter_method", ""),
+        "limit": params.get("limit", 50),
+    }, context)
+
+    if not result.get("success"):
+        return Observation(success=False, summary=f"流量分析失败: {result.get('error', '')}")
+
+    flows = result.get("flows", [])
+    new_facts = []
+    if flows:
+        methods = set(f.get("method", "") for f in flows)
+        new_facts.append(f"捕获 {len(flows)} 条流量 (methods: {list(methods)})")
+        api_flows = [f for f in flows if "/api/" in f.get("url", "")]
+        if api_flows:
+            new_facts.append(f"发现 {len(api_flows)} 条 API 流量")
+
+    return Observation(
+        success=True,
+        summary=f"流量分析: {len(flows)} 条记录",
+        new_info_gained=bool(flows),
+        new_facts=new_facts,
+        tool_call={"tool": "proxy_flows", "params": params, "result": {"count": len(flows)}},
+    )
+
+
+async def _execute_run_poc(params: dict, context: ExecutionContext, registry) -> Observation:
+    """在沙箱中执行 PoC 代码"""
+    code = params.get("code", "")
+    if not code:
+        return Observation(success=False, summary="run_poc 缺少 code")
+
+    tool = registry.get("run_poc")
+    result = await tool.execute({
+        "code": code,
+        "timeout": params.get("timeout", 30),
+    }, context)
+
+    if not result.get("success"):
+        return Observation(
+            success=False,
+            summary=f"PoC 执行失败: {result.get('error', '')}",
+            tool_call={"tool": "run_poc", "params": {"code_len": len(code)}, "result": result},
+        )
+
+    output = result.get("output", "")
+    new_facts = []
+    vuln_confirmed = False
+    severity = ""
+
+    success_indicators = ["vulnerable", "exploited", "pwned", "200 ok", "success", "flag{"]
+    if any(ind in output.lower() for ind in success_indicators):
+        vuln_confirmed = True
+        severity = "high"
+        new_facts.append(f"PoC 执行成功确认漏洞: {output[:200]}")
+
+    return Observation(
+        success=True,
+        summary=f"PoC 执行完成: exit={result.get('exit_code')}, time={result.get('execution_time_ms')}ms",
+        response_body=output[:2000],
+        vuln_confirmed=vuln_confirmed,
+        severity=severity,
+        finding={"type": "poc_verified", "evidence": output[:500], "code_snippet": code[:200]} if vuln_confirmed else {},
+        new_info_gained=bool(output),
+        new_facts=new_facts if new_facts else [f"PoC 输出: {output[:200]}"] if output else [],
+        tool_call={"tool": "run_poc", "params": {"code_len": len(code)}, "result": {"exit_code": result.get("exit_code")}},
     )

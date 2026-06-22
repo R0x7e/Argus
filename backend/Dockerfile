@@ -26,13 +26,20 @@ FROM python:3.12-slim AS runtime
 
 WORKDIR /app
 
-# 安装运行时系统依赖（nmap 供 port_scanner 工具使用）
+# 安装运行时系统依赖（nmap 供 port_scanner 工具使用，Chromium 依赖供 Playwright 使用）
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq5 nmap curl && \
-    rm -rf /var/lib/apt/lists/*
+    libpq5 nmap curl \
+    libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+    libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
+    libpango-1.0-0 libcairo2 libasound2 libxshmfence1 \
+    fonts-liberation libappindicator3-1 \
+    && rm -rf /var/lib/apt/lists/*
 
 # 从 builder 复制虚拟环境（路径已对齐 /app/venv）
 COPY --from=builder /app/venv /app/venv
+
+# 安装 Playwright Chromium 浏览器
+RUN /app/venv/bin/python -m playwright install chromium --with-deps
 
 # 复制应用代码
 COPY app/ /app/app/

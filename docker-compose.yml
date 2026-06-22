@@ -63,6 +63,10 @@ services:
       NATS_URL: nats://nats:4222
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       JWT_SECRET: ${JWT_SECRET:-argus-dev-secret-key-2024}
+      MITMPROXY_URL: http://mitmproxy:8080
+      CRAWLERGO_URL: http://crawlergo:7777
+      POC_SANDBOX_URL: http://poc-sandbox:9090
+      PROXY_FLOWS_CHANNEL: "proxy:flows"
       DEBUG: "true"
       LOG_LEVEL: info
     depends_on:
@@ -72,6 +76,10 @@ services:
         condition: service_healthy
       nats:
         condition: service_started
+      mitmproxy:
+        condition: service_healthy
+      poc-sandbox:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/system/health"]
       interval: 10s
@@ -97,6 +105,73 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+
+  # mitmproxy 流量代理 Sidecar
+  mitmproxy:
+    build:
+      context: ./mitmproxy
+      dockerfile: Dockerfile
+    container_name: argus-mitmproxy
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      PROXY_CHANNEL: "proxy:flows"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1',8080)); s.close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # crawlergo 深度爬虫 Sidecar
+  crawlergo:
+    build:
+      context: ./crawlergo
+      dockerfile: Dockerfile
+    container_name: argus-crawlergo
+    restart: unless-stopped
+    ports:
+      - "7777:7777"
+    environment:
+      LISTEN_ADDR: "0.0.0.0:7777"
+      CHROMIUM_PATH: "/usr/bin/chromium"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7777/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # Python PoC 沙箱执行器
+  poc-sandbox:
+    build:
+      context: ./poc-sandbox
+      dockerfile: Dockerfile
+    container_name: argus-poc-sandbox
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    environment:
+      LISTEN_ADDR: "0.0.0.0:9090"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    read_only: true
+    tmpfs:
+      - /tmp:size=50M
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9090/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
 volumes:
   postgres_data:

@@ -45,6 +45,18 @@ class Settings(BaseSettings):
     APP_NAME: str = "Argus"
     APP_VERSION: str = "0.1.0"
 
+    # mitmproxy 代理地址
+    MITMPROXY_URL: str = "http://mitmproxy:8080"
+
+    # crawlergo 深度爬虫 API 地址
+    CRAWLERGO_URL: str = "http://crawlergo:7777"
+
+    # PoC 沙箱执行器地址
+    POC_SANDBOX_URL: str = "http://poc-sandbox:9090"
+
+    # 代理流量 Redis 发布频道
+    PROXY_FLOWS_CHANNEL: str = "proxy:flows"
+
 
 @lru_cache()
 def get_settings() -> Settings:
