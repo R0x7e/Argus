@@ -35,7 +35,55 @@ def _extract_links(html: str) -> list[str]:
             continue
         if link.startswith("/") or (not link.startswith("http") and "." in link):
             links.add(link.split("?")[0])
+        elif link.startswith("http"):
+            links.add(link)
     return sorted(links)
+
+
+def _extract_forms(html: str) -> list[dict]:
+    """从 HTML 中提取表单信息（action + 参数名）"""
+    import re
+    forms = []
+    form_pattern = re.compile(
+        r'<form[^>]*action=["\']([^"\']*)["\'][^>]*>(.*?)</form>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    input_pattern = re.compile(
+        r'<(?:input|textarea|select)[^>]*name=["\']([^"\']+)["\']',
+        re.IGNORECASE,
+    )
+    method_pattern = re.compile(r'method=["\']([^"\']+)["\']', re.IGNORECASE)
+
+    for form_match in form_pattern.finditer(html):
+        action = form_match.group(1)
+        form_body = form_match.group(2)
+        method_m = method_pattern.search(form_match.group(0))
+        method = method_m.group(1).upper() if method_m else "GET"
+        params = input_pattern.findall(form_body)
+        if action or params:
+            forms.append({
+                "action": action,
+                "method": method,
+                "params": params,
+            })
+    return forms
+
+
+def _extract_params_from_links(links: list[str]) -> list[dict]:
+    """从 URL 列表中提取参数名"""
+    from urllib.parse import parse_qs, urlparse
+    params = []
+    for link in links:
+        if "?" not in link and "=" not in link:
+            continue
+        try:
+            parsed = urlparse(link) if link.startswith("http") else urlparse(f"http://x{link}")
+            qs = parse_qs(parsed.query)
+            for name in qs:
+                params.append({"url": link.split("?")[0], "name": name, "sample_value": qs[name][0]})
+        except Exception:
+            continue
+    return params
 
 
 def _get_llm_client() -> LLMClient:
@@ -91,11 +139,15 @@ async def _run_recon_tool(tool_name: str, params: dict, context: ExecutionContex
 
 async def _run_reconnaissance(state: VulnHuntState) -> dict:
     """
-    执行侦察阶段：仅对目标 URL 进行目录扫描和首页探测
+    执行侦察阶段：对目标 URL 进行深度侦察
 
-    SRC 模式下不做子域名枚举和端口扫描，避免大规模扫描。
+    SRC 模式下不做子域名枚举和端口扫描，但增加：
+    1. 目录扫描 + 首页探测（第一层）
+    2. 递归抓取首页链接（第二层，最多 15 个页面）
+    3. 收集所有发现的参数名和表单
     """
     import asyncio
+    import re
 
     context = _build_execution_context(state)
     target_host = context.target_host
@@ -107,11 +159,14 @@ async def _run_reconnaissance(state: VulnHuntState) -> dict:
         "open_ports": [],
         "directories": [],
         "homepage_info": {},
+        "crawled_pages": [],
+        "parameters": [],
+        "forms": [],
         "tools_run": [],
         "errors": [],
     }
 
-    # 并行执行：目录扫描 + 首页请求（获取技术栈信息）
+    # === 第一层：目录扫描 + 首页请求 ===
     tasks = [
         _run_recon_tool("dir_scan", {"base_url": target_url}, context),
         _run_recon_tool("http_request", {"url": target_url, "method": "GET"}, context),
@@ -128,26 +183,92 @@ async def _run_reconnaissance(state: VulnHuntState) -> dict:
     elif isinstance(dir_result, dict):
         recon_results["errors"].append(f"dir_scan: {dir_result.get('error', 'unknown')}")
 
-    # 处理首页请求结果（提取技术栈线索）
+    # 处理首页请求结果
     homepage_result = results[1]
+    all_links = []
     if isinstance(homepage_result, dict) and homepage_result.get("success"):
         body = homepage_result.get("body", "") or ""
-        # 从 HTML 中提取链接，发现更多端点
         links = _extract_links(body)
+        all_links = links[:]
+        # 提取页面中的表单和参数
+        forms = _extract_forms(body)
+        params = _extract_params_from_links(links)
         recon_results["homepage_info"] = {
             "status_code": homepage_result.get("status_code"),
             "headers": homepage_result.get("headers", {}),
             "body_preview": body[:3000],
             "links": links[:50],
         }
+        recon_results["forms"] = forms
+        recon_results["parameters"] = params
         recon_results["tools_run"].append("http_request")
     elif isinstance(homepage_result, dict):
         recon_results["errors"].append(f"http_request: {homepage_result.get('error', 'unknown')}")
 
+    # === 第二层：递归抓取发现的链接（最多 15 个） ===
+    crawl_targets = []
+    base_parsed = urlparse(target_url)
+    for link in all_links[:15]:
+        if link.startswith("/"):
+            full_url = f"{base_parsed.scheme}://{base_parsed.netloc}{link}"
+        elif link.startswith("http"):
+            full_url = link
+        else:
+            full_url = f"{target_url.rstrip('/')}/{link}"
+        # 只爬同域页面，跳过静态资源
+        if base_parsed.netloc not in full_url:
+            continue
+        if re.search(r'\.(css|js|png|jpg|jpeg|gif|svg|ico|woff|ttf|pdf|zip)$', full_url, re.I):
+            continue
+        crawl_targets.append(full_url)
+
+    if crawl_targets:
+        crawl_tasks = [
+            _run_recon_tool("http_request", {"url": url, "method": "GET"}, context)
+            for url in crawl_targets[:15]
+        ]
+        crawl_results = await asyncio.gather(*crawl_tasks, return_exceptions=True)
+
+        for i, cr in enumerate(crawl_results):
+            if isinstance(cr, dict) and cr.get("success"):
+                page_body = cr.get("body", "") or ""
+                page_links = _extract_links(page_body)
+                page_forms = _extract_forms(page_body)
+                page_params = _extract_params_from_links(page_links)
+                recon_results["crawled_pages"].append({
+                    "url": crawl_targets[i],
+                    "status": cr.get("status_code"),
+                    "links_count": len(page_links),
+                    "forms_count": len(page_forms),
+                })
+                # 合并新发现的链接和参数
+                for link in page_links:
+                    if link not in all_links:
+                        all_links.append(link)
+                recon_results["forms"].extend(page_forms)
+                recon_results["parameters"].extend(page_params)
+
+        recon_results["tools_run"].append("recursive_crawl")
+
+    # 去重参数
+    seen_params = set()
+    unique_params = []
+    for p in recon_results["parameters"]:
+        key = f"{p.get('url', '')}:{p.get('name', '')}"
+        if key not in seen_params:
+            seen_params.add(key)
+            unique_params.append(p)
+    recon_results["parameters"] = unique_params[:100]
+
+    # 更新 homepage_info 中的 links 为完整集合
+    recon_results["homepage_info"]["all_discovered_links"] = all_links[:100]
+
     logger.info(
-        "侦察完成: %d 目录, 首页状态 %s",
+        "侦察完成: %d 目录, %d 页面已爬取, %d 参数, %d 表单",
         len(recon_results["directories"]),
-        recon_results["homepage_info"].get("status_code", "N/A"),
+        len(recon_results["crawled_pages"]),
+        len(recon_results["parameters"]),
+        len(recon_results["forms"]),
     )
 
     return recon_results
@@ -195,13 +316,18 @@ async def orchestrator_node(state: VulnHuntState) -> dict:
         await emit(task_id, "orchestrator", "tool_result", {
             "tool_name": "reconnaissance_suite",
             "success": True,
-            "summary": f"发现 {len(recon_results['directories'])} 目录/路径, "
-                       f"首页状态: {recon_results['homepage_info'].get('status_code', 'N/A')}",
+            "summary": f"发现 {len(recon_results['directories'])} 目录, "
+                       f"{len(recon_results.get('crawled_pages', []))} 页面已爬取, "
+                       f"{len(recon_results.get('parameters', []))} 参数, "
+                       f"{len(recon_results.get('forms', []))} 表单",
         })
 
         recon_event_data = {
             "tools_run": recon_results["tools_run"],
             "dirs_found": len(recon_results["directories"]),
+            "pages_crawled": len(recon_results.get("crawled_pages", [])),
+            "params_found": len(recon_results.get("parameters", [])),
+            "forms_found": len(recon_results.get("forms", [])),
             "homepage_status": recon_results["homepage_info"].get("status_code"),
             "errors": recon_results["errors"],
         }
@@ -230,10 +356,16 @@ async def orchestrator_node(state: VulnHuntState) -> dict:
                 f"- 发现目录/路径: {json.dumps(recon_results['directories'][:30], ensure_ascii=False)}\n"
                 f"- 页面内链接: {json.dumps(recon_results['homepage_info'].get('links', [])[:40], ensure_ascii=False)}\n"
                 f"- 首页响应头: {json.dumps(dict(list(recon_results['homepage_info'].get('headers', {}).items())[:15]), ensure_ascii=False)}\n"
-                f"- 首页内容预览: {recon_results['homepage_info'].get('body_preview', '')[:1500]}\n\n"
+                f"- 首页内容预览: {recon_results['homepage_info'].get('body_preview', '')[:1500]}\n"
+                f"- 爬取页面数: {len(recon_results.get('crawled_pages', []))}\n"
+                f"- 发现参数: {json.dumps(recon_results.get('parameters', [])[:30], ensure_ascii=False)}\n"
+                f"- 发现表单: {json.dumps(recon_results.get('forms', [])[:15], ensure_ascii=False)}\n\n"
                 f"请基于以上侦察数据，分析目标的技术栈和潜在攻击面。\n"
                 f"注意：这是 SRC 精准漏洞挖掘，不要建议子域名枚举或端口扫描。\n"
-                f"重点关注页面内链接中可能存在参数注入的端点。\n"
+                f"重点关注：\n"
+                f"1. 发现的参数和表单（最可能存在注入漏洞）\n"
+                f"2. 目录扫描中发现的敏感路径\n"
+                f"3. 响应头暴露的技术栈信息\n"
                 f"输出 JSON 格式，包含 target_profile, attack_surface, strategy, next_action 字段。"
             )},
         ]
@@ -259,7 +391,20 @@ async def orchestrator_node(state: VulnHuntState) -> dict:
         attack_surface = decision.get("attack_surface", {})
         existing_endpoints = attack_surface.get("endpoints", [])
         tool_endpoints = [{"path": d, "source": "dir_scan"} for d in recon_results["directories"][:20]]
-        attack_surface["endpoints"] = existing_endpoints + tool_endpoints
+        # 添加带参数的端点（高价值目标）
+        param_endpoints = [
+            {"path": p["url"], "params": [p["name"]], "source": "crawl"}
+            for p in recon_results.get("parameters", [])[:30]
+        ]
+        # 添加表单端点
+        form_endpoints = [
+            {"path": f["action"], "method": f["method"], "params": f["params"], "source": "form"}
+            for f in recon_results.get("forms", [])[:15]
+            if f.get("action")
+        ]
+        attack_surface["endpoints"] = existing_endpoints + tool_endpoints + param_endpoints + form_endpoints
+        attack_surface["parameters"] = recon_results.get("parameters", [])[:50]
+        attack_surface["forms"] = recon_results.get("forms", [])[:20]
         bb.attack_surface = attack_surface
 
         bb.slot_status["target_profile"] = SlotStatus.READY
@@ -327,6 +472,30 @@ async def orchestrator_node(state: VulnHuntState) -> dict:
     findings_count = len(bb.findings)
     pending_hypotheses = [h for h in bb.hypotheses if h.status == "pending"]
     tested_hypotheses = [h for h in bb.hypotheses if h.status in ("confirmed", "rejected")]
+
+    # 检测连续无新发现的轮次
+    if findings_count > bb.last_findings_count:
+        bb.dry_rounds = 0
+    else:
+        bb.dry_rounds += 1
+    bb.last_findings_count = findings_count
+
+    # 连续 2 轮无新发现 → 自动结束
+    if bb.dry_rounds >= 2 and findings_count > 0:
+        logger.info("连续 %d 轮无新发现，转入报告阶段", bb.dry_rounds)
+        await emit(task_id, "orchestrator", "decision", {
+            "next_action": "report",
+            "reasoning": f"连续 {bb.dry_rounds} 轮无新发现，攻击面已基本穷尽",
+            "iteration": iteration,
+            "findings_count": findings_count,
+        })
+        await emit(task_id, "orchestrator", "agent_stopped", {"node": "orchestrator"})
+        return {
+            "blackboard": bb,
+            "current_phase": "reporting",
+            "iteration_count": iteration,
+            "events": events,
+        }
 
     progress_context = {
         "iteration": iteration,
@@ -400,7 +569,7 @@ async def orchestrator_node(state: VulnHuntState) -> dict:
     return {
         "blackboard": bb,
         "current_phase": phase,
-        "iteration_count": iteration + 1,
+        "iteration_count": iteration,
         "events": events,
     }
 

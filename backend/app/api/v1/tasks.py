@@ -162,6 +162,7 @@ async def start_task(
         await runner.start_task(
             task_id=str(task_id),
             task_config=task_config,
+            mode=task_config.get("mode", "lats"),
         )
 
         return ApiResponse(message="任务已启动", data=TaskResponse.model_validate(task))

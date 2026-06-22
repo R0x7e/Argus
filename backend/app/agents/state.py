@@ -93,6 +93,8 @@ class Blackboard:
     # ---- 控制槽 ----
     steering_directives: list = field(default_factory=list)  # 调度指令列表
     active_agents: list = field(default_factory=list)        # 当前活跃 Agent 列表
+    dry_rounds: int = 0                                      # 连续无新发现轮次
+    last_findings_count: int = 0                             # 上一轮结束时的 findings 数量
 
     # ---- 元信息 ----
     slot_status: dict = field(default_factory=dict)  # 各槽位状态 {slot_name: SlotStatus}

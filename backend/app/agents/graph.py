@@ -88,7 +88,7 @@ def build_vuln_hunt_graph():
 def create_initial_state(
     task_id: str,
     task_config: dict,
-    max_iterations: int = 3,
+    max_iterations: int = 8,
 ) -> VulnHuntState:
     """
     创建任务的初始状态

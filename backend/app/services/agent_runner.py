@@ -40,7 +40,13 @@ class AgentRunner:
         self._pause_events: dict[str, asyncio.Event] = {}
         self._session_factory = session_factory
 
-    async def start_task(self, task_id: str, task_config: dict, max_iterations: int = 3) -> None:
+    async def start_task(
+        self,
+        task_id: str,
+        task_config: dict,
+        max_iterations: int = 8,
+        mode: str = "lats",
+    ) -> None:
         """
         启动漏洞挖掘任务
 
@@ -51,6 +57,7 @@ class AgentRunner:
             task_id: 任务 ID
             task_config: 任务配置（目标 URL、范围等）
             max_iterations: 最大迭代次数
+            mode: 执行模式 - "lats" (LATS+ReAct 搜索架构) 或 "pipeline" (旧版固定管线)
         """
         if task_id in self._tasks:
             logger.warning("task_already_running", task_id=task_id)
@@ -63,12 +70,12 @@ class AgentRunner:
 
         # 创建后台任务
         task = asyncio.create_task(
-            self._run_graph(task_id, task_config, max_iterations, pause_event),
+            self._run_graph(task_id, task_config, max_iterations, pause_event, mode),
             name=f"argus-task-{task_id}",
         )
         self._tasks[task_id] = task
 
-        logger.info("agent_task_started", task_id=task_id, max_iterations=max_iterations)
+        logger.info("agent_task_started", task_id=task_id, max_iterations=max_iterations, mode=mode)
 
     async def pause_task(self, task_id: str) -> None:
         """
@@ -118,12 +125,13 @@ class AgentRunner:
         task_config: dict,
         max_iterations: int,
         pause_event: asyncio.Event,
+        mode: str = "lats",
     ) -> None:
         """
         执行 LangGraph 图的核心逻辑。
 
         整体流程：
-        1. 构建图和初始状态
+        1. 构建图和初始状态（根据 mode 选择 LATS 或旧版管线）
         2. 发射任务开始事件
         3. 执行图（ainvoke）
         4. 持久化事件和漏洞发现
@@ -133,15 +141,20 @@ class AgentRunner:
         - CancelledError: 任务被终止，更新状态为 terminated
         - 其他异常: 任务失败，更新状态为 failed 并记录错误事件
         """
-        from app.agents.graph import build_vuln_hunt_graph, create_initial_state
         from app.core.event_bus import event_bus
         from app.services.finding_service import FindingService
         from app.services.task_service import TaskService
 
         try:
-            # 构建 LangGraph 图和初始状态
-            graph = build_vuln_hunt_graph()
-            initial_state = create_initial_state(task_id, task_config, max_iterations)
+            # 根据 mode 构建不同的图和初始状态
+            if mode == "lats":
+                from app.agents.lats.graph import build_lats_graph, create_lats_initial_state
+                graph = build_lats_graph()
+                initial_state = create_lats_initial_state(task_id, task_config, max_cycles=max_iterations)
+            else:
+                from app.agents.graph import build_vuln_hunt_graph, create_initial_state
+                graph = build_vuln_hunt_graph()
+                initial_state = create_initial_state(task_id, task_config, max_iterations)
 
             # 发射任务开始事件
             async with self._session_factory() as db:
@@ -199,10 +212,12 @@ class AgentRunner:
                 findings_count = len(bb.findings) if bb else 0
                 await task_svc.transition_status(task_id, "done")
                 task_obj = await task_svc.get_task(task_id)
+                iterations = result.get("iteration_count", 0) or result.get("current_cycle", 0)
                 task_obj.progress = {
                     **(task_obj.progress or {}),
                     "findings_count": findings_count,
-                    "iterations": result.get("iteration_count", 0),
+                    "iterations": iterations,
+                    "mode": mode,
                 }
 
                 # 发射任务完成事件
@@ -215,7 +230,8 @@ class AgentRunner:
                     data={
                         "content": "任务执行完成",
                         "findings_count": findings_count,
-                        "iterations": result.get("iteration_count", 0),
+                        "iterations": iterations,
+                        "mode": mode,
                     },
                 )
                 await db.commit()

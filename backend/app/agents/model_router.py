@@ -25,6 +25,10 @@ DEFAULT_ROUTING_TABLE: dict[str, dict[str, str]] = {
         "primary": "claude-sonnet-4-6",
         "fallback": "claude-haiku-4-5",
     },
+    "react_agent": {
+        "primary": "claude-sonnet-4-6",
+        "fallback": "claude-haiku-4-5",
+    },
 }
 
 
