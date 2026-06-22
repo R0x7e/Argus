@@ -1,0 +1,105 @@
+# Argus - AI SRC 漏洞挖掘系统 Docker Compose 配置
+# 包含 PostgreSQL、Redis、NATS 基础服务
+
+version: "3.9"
+
+services:
+  # PostgreSQL 数据库服务
+  postgres:
+    image: postgres:16
+    container_name: argus-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: argus
+      POSTGRES_USER: argus
+      POSTGRES_PASSWORD: argus_dev_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U argus"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis 缓存与消息队列服务
+  redis:
+    image: redis:7
+    container_name: argus-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # NATS 消息总线（启用 JetStream）
+  nats:
+    image: nats:latest
+    container_name: argus-nats
+    restart: unless-stopped
+    ports:
+      - "4222:4222"
+      - "8222:8222"  # HTTP 监控端口
+    command: ["--jetstream", "--store_dir", "/data"]
+    volumes:
+      - nats_data:/data
+
+  # Argus 后端服务
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: argus-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://argus:argus_dev_password@postgres:5432/argus
+      REDIS_URL: redis://redis:6379/0
+      NATS_URL: nats://nats:4222
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      JWT_SECRET: ${JWT_SECRET:-argus-dev-secret-key-2024}
+      DEBUG: "true"
+      LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/system/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Argus 前端服务
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - BACKEND_INTERNAL_URL=http://backend:8000
+    container_name: argus-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_BASE: ""
+      NEXT_PUBLIC_WS_HOST: localhost:8000
+      BACKEND_INTERNAL_URL: http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+    driver: local
+  nats_data:
+    driver: local

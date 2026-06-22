@@ -1,0 +1,60 @@
+# Argus 后端项目配置
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "argus-backend"
+version = "0.1.0"
+description = "Argus - AI SRC 漏洞挖掘多 Agent 系统后端"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]",
+    "uvicorn[standard]",
+    "sqlalchemy[asyncio]",
+    "asyncpg",
+    "alembic",
+    "pydantic-settings",
+    "pydantic[email]",
+    "redis[hiredis]",
+    "nats-py",
+    "langgraph",
+    "langchain-anthropic",
+    "langchain-openai",
+    "langchain-core",
+    "httpx",
+    "jinja2",
+    "python-jose[cryptography]",
+    "cryptography",
+    "passlib[bcrypt]",
+    "structlog",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "httpx",
+    "ruff",
+]
+
+# pytest 配置
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+
+# ruff 代码检查配置
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP"]
+
+# 覆盖率配置
+[tool.coverage.run]
+source = ["app"]
+omit = ["*/tests/*", "*/alembic/*"]

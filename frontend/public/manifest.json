@@ -1,0 +1,10 @@
+{
+  "name": "Argus",
+  "short_name": "Argus",
+  "description": "AI 漏洞挖掘平台",
+  "icons": [],
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#6366f1"
+}
