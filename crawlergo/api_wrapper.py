@@ -46,8 +46,13 @@ def crawl():
             cmd, capture_output=True, text=True, timeout=180
         )
 
-        if result.stdout.strip():
-            output = json.loads(result.stdout)
+        stdout = result.stdout.strip()
+        if stdout:
+            json_start = stdout.find("{")
+            if json_start != -1:
+                output = json.loads(stdout[json_start:])
+            else:
+                output = {}
         else:
             output = {}
 

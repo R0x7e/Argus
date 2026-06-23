@@ -290,6 +290,7 @@ async def lats_mcts_select_node(state: dict) -> dict:
     await emit(task_id, "lats_mcts", "nodes_selected", {
         "count": len(selected),
         "nodes": selected_info,
+        "selection_path": [n.id for n in selected],
     })
 
     await emit(task_id, "lats_mcts", "agent_stopped", {"node": "mcts_select"})
@@ -477,6 +478,20 @@ async def lats_evaluate_node(state: dict) -> dict:
 
     tree_stats = tree.stats()
 
+    tree_snapshot = []
+    for nid, n in tree.nodes.items():
+        tree_snapshot.append({
+            "id": n.id,
+            "parent": n.parent_id,
+            "endpoint": n.state.current_endpoint,
+            "vuln_type": n.state.vuln_type,
+            "param": n.state.current_param,
+            "value": round(n.average_reward, 3),
+            "visits": n.visit_count,
+            "status": n.status.value,
+            "depth": n.depth,
+        })
+
     await emit(task_id, "lats_eval", "cycle_summary", {
         "cycle": cycle + 1,
         "max_cycles": max_cycles,
@@ -485,6 +500,7 @@ async def lats_evaluate_node(state: dict) -> dict:
         "dry_cycles": dry_cycles,
         "pruned": pruned,
         "tree_stats": tree_stats,
+        "tree_snapshot": tree_snapshot,
     })
 
     await emit(task_id, "lats_eval", "agent_stopped", {"node": "evaluate"})

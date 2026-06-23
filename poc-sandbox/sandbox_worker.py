@@ -11,6 +11,7 @@ PoC 沙箱 Worker — 隔离执行 Python PoC 代码
 import io
 import time
 import asyncio
+import builtins
 from contextlib import redirect_stdout, redirect_stderr
 
 from fastapi import FastAPI
@@ -18,13 +19,14 @@ from pydantic import BaseModel
 from RestrictedPython import compile_restricted, safe_globals
 from RestrictedPython.Eval import default_guarded_getiter
 from RestrictedPython.Guards import guarded_unpack_sequence, safer_getattr
+from RestrictedPython.PrintCollector import PrintCollector
 
 app = FastAPI(title="Argus PoC Sandbox")
 
 ALLOWED_IMPORTS = {
     "requests", "urllib3", "base64", "json", "hashlib",
     "re", "time", "socket", "struct", "urllib", "http",
-    "collections", "itertools", "string", "binascii",
+    "collections", "itertools", "string", "binascii", "zlib",
 }
 
 
@@ -49,7 +51,7 @@ def _safe_import(name, *args, **kwargs):
         raise ImportError(
             f"Import '{name}' is not allowed. Allowed: {sorted(ALLOWED_IMPORTS)}"
         )
-    return __builtins__.__import__(name, *args, **kwargs)
+    return builtins.__import__(name, *args, **kwargs)
 
 
 def _run_code(byte_code, restricted_globals, stdout_buf, stderr_buf):
@@ -75,16 +77,23 @@ async def execute(req: ExecuteRequest):
 
     try:
         result = compile_restricted(req.code, filename="<poc>", mode="exec")
-        if result.errors:
-            return ExecuteResponse(
-                success=False,
-                error=f"Compilation errors: {'; '.join(result.errors)}",
-                exit_code=1,
-            )
-        byte_code = result.code
+        if hasattr(result, "errors"):
+            if result.errors:
+                return ExecuteResponse(
+                    success=False,
+                    error=f"Compilation errors: {'; '.join(result.errors)}",
+                    exit_code=1,
+                )
+            byte_code = result.code
+        else:
+            byte_code = result
     except SyntaxError as e:
         return ExecuteResponse(
             success=False, error=f"Syntax error: {e}", exit_code=1
+        )
+    except Exception as e:
+        return ExecuteResponse(
+            success=False, error=f"Compilation error: {e}", exit_code=1
         )
 
     restricted_globals = safe_globals.copy()
@@ -93,6 +102,10 @@ async def execute(req: ExecuteRequest):
     restricted_globals["_getiter_"] = default_guarded_getiter
     restricted_globals["_unpack_sequence_"] = guarded_unpack_sequence
     restricted_globals["_getattr_"] = safer_getattr
+    restricted_globals["_print_"] = PrintCollector
+    restricted_globals["_getitem_"] = lambda obj, key: obj[key]
+    restricted_globals["_write_"] = lambda obj: obj
+    restricted_globals["_inplacevar_"] = lambda op, x, y: op(x, y)
     restricted_globals["TARGET_HOST"] = req.target_host
     restricted_globals["ALLOWED_HOSTS"] = req.allowed_hosts or [req.target_host]
 
@@ -109,18 +122,24 @@ async def execute(req: ExecuteRequest):
             timeout=req.timeout,
         )
         elapsed_ms = int((time.monotonic() - start) * 1000)
+        printed = restricted_globals.get("_print")
+        printed_output = printed() if callable(printed) else ""
+        combined_output = (stdout_capture.getvalue() + printed_output)[:10000]
         return ExecuteResponse(
             success=True,
-            output=stdout_capture.getvalue()[:10000],
+            output=combined_output,
             error=stderr_capture.getvalue()[:2000],
             execution_time_ms=elapsed_ms,
             exit_code=0,
         )
     except asyncio.TimeoutError:
         elapsed_ms = int((time.monotonic() - start) * 1000)
+        printed = restricted_globals.get("_print")
+        printed_output = printed() if callable(printed) else ""
+        combined_output = (stdout_capture.getvalue() + printed_output)[:5000]
         return ExecuteResponse(
             success=False,
-            output=stdout_capture.getvalue()[:5000],
+            output=combined_output,
             error=f"Execution timeout ({req.timeout}s)",
             execution_time_ms=elapsed_ms,
             exit_code=124,

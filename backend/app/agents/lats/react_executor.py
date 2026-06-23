@@ -12,6 +12,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.agents.emit import emit
 from app.agents.llm import LLMClient
 from app.tools.base import ExecutionContext
 
@@ -136,6 +137,13 @@ async def react_agent_loop(
                 observation="请求回溯",
                 reward=0.0,
             ))
+            await emit(
+                task_id=context.task_id, agent="lats_react", event_type="react_step",
+                data={"node_id": node.id, "step": step_idx, "thought": thought,
+                      "action": "backtrack", "action_params": {}, "observation": "请求回溯",
+                      "success": True, "reward": 0.0, "new_facts": [], "vuln_confirmed": False,
+                      "duration_ms": 0, "tool_name": ""},
+            )
             return ReactResult(
                 node_id=node.id,
                 status="backtrack",
@@ -151,6 +159,13 @@ async def react_agent_loop(
                 observation="放弃当前路径",
                 reward=0.0,
             ))
+            await emit(
+                task_id=context.task_id, agent="lats_react", event_type="react_step",
+                data={"node_id": node.id, "step": step_idx, "thought": thought,
+                      "action": "give_up", "action_params": {}, "observation": "放弃当前路径",
+                      "success": True, "reward": 0.0, "new_facts": [], "vuln_confirmed": False,
+                      "duration_ms": 0, "tool_name": ""},
+            )
             return ReactResult(
                 node_id=node.id,
                 status="exhausted",
@@ -166,6 +181,13 @@ async def react_agent_loop(
                 observation="提交漏洞发现",
                 reward=1.0,
             ))
+            await emit(
+                task_id=context.task_id, agent="lats_react", event_type="react_step",
+                data={"node_id": node.id, "step": step_idx, "thought": thought,
+                      "action": "report_finding", "action_params": action_params,
+                      "observation": "提交漏洞发现", "success": True, "reward": 1.0,
+                      "new_facts": [], "vuln_confirmed": True, "duration_ms": 0, "tool_name": ""},
+            )
             return ReactResult(
                 node_id=node.id,
                 status="finding",
@@ -201,6 +223,26 @@ async def react_agent_loop(
             observation=observation.summary,
             reward=step_reward,
         ))
+
+        await emit(
+            task_id=context.task_id,
+            agent="lats_react",
+            event_type="react_step",
+            data={
+                "node_id": node.id,
+                "step": step_idx,
+                "thought": thought,
+                "action": action_str,
+                "action_params": action_params,
+                "observation": observation.summary,
+                "success": observation.success,
+                "reward": round(step_reward, 3),
+                "new_facts": observation.new_facts,
+                "vuln_confirmed": observation.vuln_confirmed,
+                "duration_ms": observation.response_time_ms,
+                "tool_name": observation.tool_call.get("tool", "") if observation.tool_call else "",
+            },
+        )
 
         # === 检查是否确认漏洞 ===
         if observation.vuln_confirmed:
