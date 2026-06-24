@@ -159,9 +159,12 @@ async def start_task(
             "target_type": task.target_type,
             "strategy": task.strategy,
         }
+        # v2-fix: 从任务配置中提取 max_iterations，默认 15，避免参数丢失
+        max_iterations = int(task_config.get("max_iterations", 15))
         await runner.start_task(
             task_id=str(task_id),
             task_config=task_config,
+            max_iterations=max_iterations,
             mode=task_config.get("mode", "lats"),
         )
 

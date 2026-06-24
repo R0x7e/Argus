@@ -161,18 +161,21 @@ class LLMClient:
         agent: str,
         messages: list[dict[str, str]],
         tools: list[dict[str, Any]] | None = None,
+        task_id: str = "",
     ) -> str:
         """
         调用 LLM 获取响应
 
         Args:
-            agent: 调用方 Agent 名称（用于模型选择和预算跟踪）
-            messages: 消息列表，格式 [{"role": "...", "content": "..."}]
-            tools: 可选的工具定义列表（用于 function calling）
+            agent: 调用方 Agent 名称
+            messages: 消息列表
+            tools: 可选的工具定义列表
+            task_id: v2: 关联任务 ID (用于 token 事件下发)
 
         Returns:
             LLM 响应的文本内容
         """
+        self._current_task_id = task_id  # v2
         await self._ensure_initialized()
 
         # 检查预算
@@ -242,6 +245,25 @@ class LLMClient:
                         tokens_in=usage.get("input_tokens", 0),
                         tokens_out=usage.get("output_tokens", 0),
                     )
+                    # v2: 下发 token 使用事件到前端
+                    try:
+                        from app.agents.emit import emit
+                        tid = getattr(self, '_current_task_id', '') or 'unknown'
+                        budget = self.token_budget
+                        await emit(
+                            task_id=tid,
+                            agent="system",
+                            event_type="token_usage",
+                            data={
+                                "tokens_in": usage.get("input_tokens", 0),
+                                "tokens_out": usage.get("output_tokens", 0),
+                                "cumulative_spent": budget.spent if budget else 0,
+                                "cumulative_budget": budget.total_budget if budget else 500000,
+                                "remaining_ratio": round(budget.remaining_ratio(), 4) if budget else 1.0,
+                            },
+                        )
+                    except Exception:
+                        pass
 
                 # 提取文本内容
                 if hasattr(response, "content"):

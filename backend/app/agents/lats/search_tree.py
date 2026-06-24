@@ -1,12 +1,19 @@
 """
-LATS 搜索树核心数据结构
+LATS 搜索树核心数据结构 v2
 
 实现蒙特卡洛树搜索 (MCTS) 的节点、树结构和核心算法：
-- SearchNode: 搜索树节点（含 MCTS 统计量）
+- SearchNode: 搜索树节点（含 MCTS 统计量 + v2 扩展字段）
 - NodeState: 节点状态快照（支持回溯）
-- SearchTree: 搜索树管理器（选择、扩展、回传、剪枝）
+- SearchTree: 搜索树管理器（v2 自适应选择、Graveyard、扩展）
+
+v2 新增:
+- 自适应多因素节点选择器 (6-factor)
+- 节点分层状态机 (SEED/PROBING/PROMOTED/HIGH_SIGNAL/LOW_SIGNAL/KILLED)
+- Graveyard 与节点复活机制
+- 多样性过滤与冷启动策略
 """
 
+import hashlib
 import math
 import uuid
 from dataclasses import dataclass, field
@@ -15,17 +22,23 @@ from typing import Any
 
 
 class NodeStatus(str, Enum):
+    """节点状态 (v2 扩展)"""
     UNEXPLORED = "unexplored"
     EXPLORING = "exploring"
-    NEEDS_EXPANSION = "needs_expansion"
     EXHAUSTED = "exhausted"
     CONFIRMED_VULN = "confirmed_vuln"
     PRUNED = "pruned"
+    SEED = "seed"
+    PROBING = "probing"
+    PROMOTED = "promoted"
+    HIGH_SIGNAL = "high_signal"
+    LOW_SIGNAL = "low_signal"
+    KILLED = "killed"
+    NEEDS_EXPANSION = "needs_expansion"
 
 
 @dataclass
 class ThoughtStep:
-    """ReAct 执行过程中的一步 Thought-Action-Observation"""
     thought: str
     action: str
     action_params: dict
@@ -35,7 +48,6 @@ class ThoughtStep:
 
 @dataclass
 class ToolCall:
-    """工具调用记录"""
     tool_name: str
     params: dict
     result: dict
@@ -44,19 +56,16 @@ class ToolCall:
 
 @dataclass
 class NodeState:
-    """节点状态快照 — 完整描述了搜索树中一个节点的探索状态"""
     target_url: str
     current_endpoint: str
     current_param: str | None
     vuln_type: str
-
     known_facts: list[str] = field(default_factory=list)
     tried_actions: list[str] = field(default_factory=list)
     reasoning_chain: list[ThoughtStep] = field(default_factory=list)
     tool_history: list[ToolCall] = field(default_factory=list)
 
     def copy(self) -> "NodeState":
-        """深拷贝状态用于子节点创建"""
         return NodeState(
             target_url=self.target_url,
             current_endpoint=self.current_endpoint,
@@ -71,29 +80,26 @@ class NodeState:
 
 @dataclass
 class SearchNode:
-    """搜索树节点"""
+    """搜索树节点 (v2 扩展)"""
     id: str
     parent_id: str | None
     depth: int
-
     state: NodeState
-
-    # MCTS 统计
     visit_count: int = 0
     total_reward: float = 0.0
-
-    # 节点元信息
     action_taken: str | None = None
     action_params: dict = field(default_factory=dict)
     observation_summary: str = ""
-
-    # 控制
     status: NodeStatus = NodeStatus.UNEXPLORED
     children: list[str] = field(default_factory=list)
-
-    # 评估
     value_estimate: float = 0.0
+    empirical_value: float = 0.0
     last_visit_step: int = 0
+    probe_level: int = 0
+    probe_results: list[dict] = field(default_factory=list)
+    created_at_cycle: int = 0
+    promoted_at_cycle: int | None = None
+    diversity_tags: list[str] = field(default_factory=list)
 
     @property
     def average_reward(self) -> float:
@@ -103,17 +109,25 @@ class SearchNode:
 
 
 class SearchTree:
-    """
-    搜索树管理器
+    """搜索树管理器 (v2: 自适应选择 + Graveyard)"""
 
-    管理搜索树的生命周期和 MCTS 核心算法。
-    """
+    PRIOR_INITIAL_WEIGHT: float = 0.3
+    PRIOR_DECAY_STEPS: float = 50.0
+    EXPLORATION_DECAY_STEPS: float = 60.0
+    DIVERSITY_WEIGHT: float = 0.15
+    RECENCY_WEIGHT: float = 0.10
+    KNOWLEDGE_WEIGHT: float = 1.0
+    DIVERSITY_SIMILARITY_THRESHOLD: float = 0.7
+    WILSON_CONFIDENCE_Z: float = 1.96
 
     def __init__(self):
         self.nodes: dict[str, SearchNode] = {}
         self.root_id: str | None = None
         self.global_step: int = 0
         self.findings: list[dict] = []
+        self.recent_selections: list[str] = []
+        self.graveyard: dict[str, SearchNode] = {}
+        self.total_expected_steps: int = 200
 
     def set_root(self, node: SearchNode) -> None:
         self.root_id = node.id
@@ -136,116 +150,195 @@ class SearchTree:
     def get_root(self) -> SearchNode | None:
         return self.nodes.get(self.root_id) if self.root_id else None
 
-    # ──── MCTS: SELECT ────
+    # ──── v2: 自适应选择 ────
 
-    def select_best_leaf(self, exploration_weight: float = 1.414) -> SearchNode | None:
-        """
-        从根节点沿 UCB1 最优路径向下，选择一个待探索的叶节点。
-        """
-        root = self.get_root()
-        if root is None:
-            return None
+    def _exploitation_weight(self, s: int) -> float:
+        return 1.0 - 0.6 * math.exp(-s / 80.0)
 
-        current = root
-        while current.children:
-            unexplored = [
-                self.nodes[cid] for cid in current.children
-                if self.nodes[cid].status in (NodeStatus.UNEXPLORED, NodeStatus.NEEDS_EXPANSION)
-            ]
-            if unexplored:
-                return max(unexplored, key=lambda n: self._ucb_score(n, current, exploration_weight))
+    def _exploration_weight(self, s: int) -> float:
+        return 0.2 + 0.8 * math.exp(-s / self.EXPLORATION_DECAY_STEPS)
 
-            explorable = [
-                self.nodes[cid] for cid in current.children
-                if self.nodes[cid].status not in (NodeStatus.EXHAUSTED, NodeStatus.PRUNED, NodeStatus.CONFIRMED_VULN)
-            ]
-            if not explorable:
-                return None
+    def _prior_weight(self, s: int) -> float:
+        return self.PRIOR_INITIAL_WEIGHT * math.exp(-s / self.PRIOR_DECAY_STEPS)
 
-            current = max(explorable, key=lambda n: self._ucb_score(n, current, exploration_weight))
+    def _wilson_score_lower_bound(self, node: SearchNode) -> float:
+        n = node.visit_count
+        if n >= 5:
+            return node.total_reward / n if n > 0 else 0.0
+        if n == 0:
+            return 0.0
+        p = node.total_reward / n
+        z = self.WILSON_CONFIDENCE_Z
+        z2 = z * z
+        denominator = 1.0 + z2 / n
+        mean = (p + z2 / (2.0 * n)) / denominator
+        std = z * math.sqrt((p * (1.0 - p) / n + z2 / (4.0 * n * n))) / denominator
+        return max(0.0, mean - std)
 
-        if current.status in (NodeStatus.EXHAUSTED, NodeStatus.PRUNED):
-            return None
-        return current
+    def _node_similarity(self, a: SearchNode, b: SearchNode) -> float:
+        score = 0.0
+        if a.state.vuln_type == b.state.vuln_type:
+            score += 0.3
+        if a.state.current_endpoint == b.state.current_endpoint:
+            score += 0.4
+        if a.state.current_param == b.state.current_param:
+            score += 0.3
+        return min(1.0, score)
 
-    def select_batch(self, batch_size: int, exploration_weight: float = 1.414) -> list[SearchNode]:
-        """选择一批待探索的节点（用于并发执行）"""
+    def _diversity_score(self, node: SearchNode) -> float:
+        if not self.recent_selections:
+            return 1.0
+        similarities = []
+        for rid in self.recent_selections[-10:]:
+            recent = self.nodes.get(rid)
+            if recent is None:
+                continue
+            similarities.append(self._node_similarity(node, recent))
+        if not similarities:
+            return 1.0
+        return 1.0 - sum(similarities) / len(similarities)
+
+    def _recency_score(self, node: SearchNode) -> float:
+        age = max(1, node.created_at_cycle)
+        return math.exp(-age / 3.0)
+
+    def _knowledge_score(self, node: SearchNode, knowledge: Any) -> float:
+        score = 0.0
+        try:
+            if hasattr(knowledge, 'waf_profile') and knowledge.waf_profile:
+                bypasses = knowledge.waf_profile.get("bypass_techniques", [])
+                if bypasses:
+                    score += 0.1
+            if hasattr(knowledge, 'effective_params') and knowledge.effective_params:
+                if node.state.current_param in knowledge.effective_params:
+                    score += 0.05
+        except Exception:
+            pass
+        return min(0.5, score)
+
+    def _adaptive_selection_score(self, node: SearchNode, parent: SearchNode | None = None, knowledge: Any = None) -> float:
+        s = self.global_step
+        parent_visits = parent.visit_count if parent else max(1, node.visit_count)
+        alpha_val = self._exploitation_weight(s)
+        exploitation = self._wilson_score_lower_bound(node)
+        beta_val = self._exploration_weight(s)
+        if node.visit_count > 0:
+            exploration_c = 2.0 * math.exp(-s / self.total_expected_steps)
+            exploration = exploration_c * math.sqrt(math.log(max(1, parent_visits)) / node.visit_count)
+        else:
+            exploration = float('inf')
+        gamma_val = self._prior_weight(s)
+        prior = node.value_estimate
+        diversity = self._diversity_score(node)
+        recency = self._recency_score(node)
+        knowledge_score = self._knowledge_score(node, knowledge) if knowledge else 0.0
+        if node.visit_count == 0:
+            return (alpha_val * exploitation + gamma_val * prior + self.DIVERSITY_WEIGHT * diversity + self.RECENCY_WEIGHT * recency + self.KNOWLEDGE_WEIGHT * knowledge_score)
+        freshness = 1.0 / (1.0 + 0.01 * (s - node.last_visit_step))
+        return (alpha_val * exploitation + beta_val * exploration + gamma_val * prior + self.DIVERSITY_WEIGHT * diversity + self.RECENCY_WEIGHT * recency + self.KNOWLEDGE_WEIGHT * knowledge_score) * freshness
+
+    def _is_too_similar(self, node: SearchNode, selected: list[SearchNode]) -> bool:
+        for sel in selected:
+            if self._node_similarity(node, sel) > self.DIVERSITY_SIMILARITY_THRESHOLD:
+                return True
+        return False
+
+    def _record_selections(self, selected: list[SearchNode]) -> None:
+        for n in selected:
+            self.recent_selections.append(n.id)
+        if len(self.recent_selections) > 30:
+            self.recent_selections = self.recent_selections[-30:]
+
+    def _collect_candidates(self) -> list[SearchNode]:
+        candidates = []
+        for node in self.nodes.values():
+            # v5: 根节点不应被选中执行
+            if node.id == self.root_id:
+                continue
+            if node.status in (NodeStatus.SEED, NodeStatus.PROMOTED, NodeStatus.HIGH_SIGNAL, NodeStatus.UNEXPLORED, NodeStatus.NEEDS_EXPANSION, NodeStatus.LOW_SIGNAL):
+                candidates.append(node)
+        return candidates
+
+    def select_batch(self, batch_size: int = 4, exploration_weight: float = 1.414, current_cycle: int = 0, cold_start_until_cycle: int = 1) -> list[SearchNode]:
+        candidates = self._collect_candidates()
+        if not candidates:
+            return []
+        # v5: Cold start with endpoint diversity
+        if current_cycle <= cold_start_until_cycle:
+            candidates.sort(key=lambda n: n.value_estimate, reverse=True)
+            selected = []
+            seen_eps = set()
+            for n in candidates:
+                if len(selected) >= batch_size:
+                    break
+                # v5: 冷启动多样性 — 跳过与已选节点 endpoint 前缀重叠的
+                ep_prefix = n.state.current_endpoint.rsplit("/", 1)[0] if n.state.current_endpoint else ""
+                if ep_prefix and ep_prefix in seen_eps:
+                    continue
+                selected.append(n)
+                if ep_prefix:
+                    seen_eps.add(ep_prefix)
+            if not selected:
+                selected = [n for n in candidates if n.status == NodeStatus.SEED][:batch_size]
+            if selected:
+                self._record_selections(selected)
+                return selected
+        # Normal: adaptive scoring + diversity filter
+        scored = [(n, self._adaptive_selection_score(n, self.nodes.get(n.parent_id) if n.parent_id else n)) for n in candidates]
+        scored.sort(key=lambda x: x[1], reverse=True)
         selected = []
-        visited_ids = set()
-
-        for _ in range(batch_size * 3):
-            node = self._select_avoiding(visited_ids, exploration_weight)
-            if node is None:
-                break
-            if node.id not in visited_ids:
-                selected.append(node)
-                visited_ids.add(node.id)
+        for node, score in scored:
             if len(selected) >= batch_size:
                 break
-
+            if self._is_too_similar(node, selected):
+                continue
+            selected.append(node)
+        self._record_selections(selected)
         return selected
 
-    def _select_avoiding(self, avoid: set[str], exploration_weight: float) -> SearchNode | None:
-        """选择不在 avoid 集合中的最优叶节点"""
+    def select_best_leaf(self, exploration_weight: float = 1.414) -> SearchNode | None:
         root = self.get_root()
         if root is None:
             return None
-
         current = root
         while current.children:
-            candidates = [
-                self.nodes[cid] for cid in current.children
-                if cid not in avoid and self.nodes[cid].status not in (
-                    NodeStatus.EXHAUSTED, NodeStatus.PRUNED, NodeStatus.CONFIRMED_VULN
-                )
-            ]
-            if not candidates:
+            unexplored = [self.nodes[cid] for cid in current.children if self.nodes[cid].status in (NodeStatus.UNEXPLORED, NodeStatus.NEEDS_EXPANSION, NodeStatus.SEED, NodeStatus.PROMOTED, NodeStatus.HIGH_SIGNAL, NodeStatus.LOW_SIGNAL)]
+            if unexplored:
+                return max(unexplored, key=lambda n: self._adaptive_selection_score(n, current))
+            explorable = [self.nodes[cid] for cid in current.children if self.nodes[cid].status not in (NodeStatus.EXHAUSTED, NodeStatus.PRUNED, NodeStatus.CONFIRMED_VULN, NodeStatus.KILLED)]
+            if not explorable:
                 return None
-            current = max(candidates, key=lambda n: self._ucb_score(n, current, exploration_weight))
-
-        if current.id in avoid:
+            current = max(explorable, key=lambda n: self._adaptive_selection_score(n, current))
+        if current.status in (NodeStatus.EXHAUSTED, NodeStatus.PRUNED, NodeStatus.KILLED):
             return None
         return current
 
     def _ucb_score(self, node: SearchNode, parent: SearchNode, C: float) -> float:
-        """UCB1 + 领域先验"""
-        if node.visit_count == 0:
-            return float('inf')
+        return self._adaptive_selection_score(node, parent)
 
-        exploitation = node.total_reward / node.visit_count
-        exploration = C * math.sqrt(math.log(max(1, parent.visit_count)) / node.visit_count)
-        prior = 0.3 * node.value_estimate
-        freshness = 1.0 / (1.0 + 0.01 * (self.global_step - node.last_visit_step))
-
-        return (exploitation + exploration + prior) * freshness
-
-    # ──── MCTS: BACKPROPAGATE ────
+    # ──── Backpropagate ────
 
     def backpropagate(self, node_id: str, reward: float) -> None:
-        """将 reward 从节点反向传播到根"""
         self.global_step += 1
         current = self.nodes.get(node_id)
         decay = 1.0
-
         while current:
             current.visit_count += 1
             current.total_reward += reward * decay
             current.last_visit_step = self.global_step
+            if current.visit_count > 0:
+                current.empirical_value = current.total_reward / current.visit_count
             decay *= 0.85
             current = self.nodes.get(current.parent_id) if current.parent_id else None
 
-    # ──── MCTS: PRUNING ────
+    # ──── Pruning + Graveyard ────
 
     def should_prune(self, node: SearchNode, budget_ratio: float = 1.0) -> bool:
-        """判断是否应该剪枝"""
         if node.visit_count >= 5 and node.total_reward <= 0:
             return True
         if node.depth >= 15:
             return True
-        if node.children and all(
-            self.nodes[cid].status in (NodeStatus.EXHAUSTED, NodeStatus.PRUNED)
-            for cid in node.children
-        ):
+        if node.children and all(self.nodes[cid].status in (NodeStatus.EXHAUSTED, NodeStatus.PRUNED, NodeStatus.KILLED) for cid in node.children):
             return True
         if budget_ratio < 0.3 and node.value_estimate < 0.3:
             return True
@@ -256,31 +349,53 @@ class SearchTree:
         if node:
             node.status = NodeStatus.PRUNED
 
-    # ──── 回溯 ────
+    def kill_node(self, node_id: str, reason: str = "") -> None:
+        node = self.nodes.get(node_id)
+        if node:
+            node.status = NodeStatus.KILLED
+            node.observation_summary = f"KILLED: {reason}" if reason else "KILLED"
+            self.graveyard[node_id] = node
+
+    def resurrect_from_graveyard(self, knowledge_changes: list[str]) -> list[SearchNode]:
+        resurrected = []
+        for node_id, node in list(self.graveyard.items()):
+            reason = (node.observation_summary or "").lower()
+            should_resurrect = False
+            if "waf" in reason and "bypass_technique" in knowledge_changes:
+                should_resurrect = True
+            if "auth" in reason and "auth_context" in knowledge_changes:
+                should_resurrect = True
+            if ("filtered" in reason or "blocked" in reason) and "bypass_technique" in knowledge_changes:
+                should_resurrect = True
+            if "404" in reason and "new_endpoint" in knowledge_changes:
+                should_resurrect = True
+            if should_resurrect:
+                node.status = NodeStatus.SEED
+                node.probe_level = 0
+                node.probe_results = []
+                node.created_at_cycle = max(1, self.global_step // 4)
+                del self.graveyard[node_id]
+                resurrected.append(node)
+        return resurrected
+
+    def get_graveyard_stats(self) -> dict:
+        return {"total_killed": len(self.graveyard), "killed_reasons": {rid: node.observation_summary for rid, node in list(self.graveyard.items())[:10]}}
+
+    # ──── Backtrack + Helpers ────
 
     def backtrack(self, from_node_id: str) -> SearchNode | None:
-        """从指定节点回溯到最近的有未探索子节点的祖先"""
         current = self.nodes.get(from_node_id)
         if current is None:
             return None
-
         current.status = NodeStatus.EXHAUSTED
-
         while current.parent_id:
             parent = self.nodes[current.parent_id]
-            unexplored_siblings = [
-                self.nodes[cid] for cid in parent.children
-                if self.nodes[cid].status in (NodeStatus.UNEXPLORED, NodeStatus.NEEDS_EXPANSION)
-            ]
+            unexplored_siblings = [self.nodes[cid] for cid in parent.children if self.nodes[cid].status in (NodeStatus.UNEXPLORED, NodeStatus.NEEDS_EXPANSION, NodeStatus.SEED, NodeStatus.PROMOTED, NodeStatus.HIGH_SIGNAL)]
             if unexplored_siblings:
-                return max(unexplored_siblings, key=lambda n: n.value_estimate)
-
+                return max(unexplored_siblings, key=lambda n: self._adaptive_selection_score(n, parent))
             parent.status = NodeStatus.EXHAUSTED
             current = parent
-
         return None
-
-    # ──── 辅助方法 ────
 
     def mark_exhausted(self, node_id: str) -> None:
         node = self.nodes.get(node_id)
@@ -292,57 +407,66 @@ class SearchTree:
         if node:
             node.status = NodeStatus.CONFIRMED_VULN
 
+    def mark_killed(self, node_id: str, reason: str = "") -> None:
+        self.kill_node(node_id, reason)
+
+    def mark_promoted(self, node_id: str, cycle: int = 0) -> None:
+        node = self.nodes.get(node_id)
+        if node:
+            node.status = NodeStatus.PROMOTED
+            node.probe_level = 1
+            node.promoted_at_cycle = cycle
+
+    def mark_high_signal(self, node_id: str) -> None:
+        node = self.nodes.get(node_id)
+        if node:
+            node.status = NodeStatus.HIGH_SIGNAL
+            node.probe_level = 2
+
     def record_finding(self, finding: dict) -> None:
         self.findings.append(finding)
 
     def all_explored(self) -> bool:
-        """检查搜索树是否已全部探索完毕"""
         root = self.get_root()
         if root is None:
             return True
-        return root.status in (NodeStatus.EXHAUSTED, NodeStatus.PRUNED)
+        active = (NodeStatus.UNEXPLORED, NodeStatus.NEEDS_EXPANSION, NodeStatus.EXPLORING, NodeStatus.SEED, NodeStatus.PROBING, NodeStatus.PROMOTED, NodeStatus.HIGH_SIGNAL, NodeStatus.LOW_SIGNAL)
+        for node in self.nodes.values():
+            if node.status in active:
+                return False
+        return True
 
     def max_unexplored_value(self) -> float:
-        """返回未探索节点中的最高价值估计"""
         max_val = 0.0
         for node in self.nodes.values():
-            if node.status in (NodeStatus.UNEXPLORED, NodeStatus.NEEDS_EXPANSION):
-                max_val = max(max_val, node.value_estimate)
+            if node.status in (NodeStatus.UNEXPLORED, NodeStatus.NEEDS_EXPANSION, NodeStatus.SEED, NodeStatus.PROMOTED, NodeStatus.HIGH_SIGNAL, NodeStatus.LOW_SIGNAL):
+                val = node.empirical_value if node.empirical_value > 0 else node.value_estimate
+                max_val = max(max_val, val)
         return max_val
 
     def get_unexplored_children(self, node: SearchNode) -> list[SearchNode]:
-        """获取节点的未探索子节点"""
-        return [
-            self.nodes[cid] for cid in node.children
-            if self.nodes[cid].status == NodeStatus.UNEXPLORED
-        ]
+        active = (NodeStatus.UNEXPLORED, NodeStatus.SEED, NodeStatus.PROMOTED, NodeStatus.HIGH_SIGNAL, NodeStatus.LOW_SIGNAL)
+        return [self.nodes[cid] for cid in node.children if self.nodes[cid].status in active]
 
     def stats(self) -> dict:
-        """返回搜索树统计信息"""
         total = len(self.nodes)
         explored = sum(1 for n in self.nodes.values() if n.visit_count > 0)
         pruned = sum(1 for n in self.nodes.values() if n.status == NodeStatus.PRUNED)
+        killed = sum(1 for n in self.nodes.values() if n.status == NodeStatus.KILLED)
         confirmed = sum(1 for n in self.nodes.values() if n.status == NodeStatus.CONFIRMED_VULN)
+        seeds = sum(1 for n in self.nodes.values() if n.status == NodeStatus.SEED)
+        promoted = sum(1 for n in self.nodes.values() if n.status == NodeStatus.PROMOTED)
+        high_signal = sum(1 for n in self.nodes.values() if n.status == NodeStatus.HIGH_SIGNAL)
         return {
-            "total_nodes": total,
-            "explored": explored,
-            "pruned": pruned,
-            "confirmed_vulns": confirmed,
-            "findings": len(self.findings),
-            "global_step": self.global_step,
+            "total_nodes": total, "explored": explored, "pruned": pruned, "killed": killed,
+            "graveyard_size": len(self.graveyard), "confirmed_vulns": confirmed,
+            "seeds": seeds, "promoted": promoted, "high_signal": high_signal,
+            "findings": len(self.findings), "global_step": self.global_step,
+            "prior_weight": round(self._prior_weight(self.global_step), 4),
+            "exploration_weight": round(self._exploration_weight(self.global_step), 4),
         }
 
-    def create_child_node(
-        self,
-        parent: SearchNode,
-        action: str,
-        action_params: dict,
-        vuln_type: str | None = None,
-        endpoint: str | None = None,
-        param: str | None = None,
-        value_estimate: float = 0.5,
-    ) -> SearchNode:
-        """便捷方法：创建子节点"""
+    def create_child_node(self, parent: SearchNode, action: str, action_params: dict, vuln_type: str | None = None, endpoint: str | None = None, param: str | None = None, value_estimate: float = 0.5, created_at_cycle: int = 0) -> SearchNode:
         child_state = parent.state.copy()
         if vuln_type:
             child_state.vuln_type = vuln_type
@@ -350,15 +474,7 @@ class SearchTree:
             child_state.current_endpoint = endpoint
         if param:
             child_state.current_param = param
-
-        child = SearchNode(
-            id=str(uuid.uuid4()),
-            parent_id=parent.id,
-            depth=parent.depth + 1,
-            state=child_state,
-            action_taken=action,
-            action_params=action_params,
-            value_estimate=value_estimate,
-        )
+        ep_hash = hashlib.md5((endpoint or child_state.current_endpoint).encode()).hexdigest()[:8] if (endpoint or child_state.current_endpoint) else "unknown"
+        child = SearchNode(id=str(uuid.uuid4()), parent_id=parent.id, depth=parent.depth + 1, state=child_state, action_taken=action, action_params=action_params, value_estimate=value_estimate, created_at_cycle=created_at_cycle, diversity_tags=[vuln_type or child_state.vuln_type or "unknown", ep_hash, (param or child_state.current_param or "no_param")])
         self.add_child(parent, child)
         return child

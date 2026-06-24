@@ -1,9 +1,7 @@
 """
-WebSocket 端点 - 实时事件流推送
+WebSocket 端点 - 实时事件流推送 + 用户干预下行
 
-提供按任务 ID 订阅事件流的 WebSocket 接口，
-客户端连接后自动接收该任务的所有实时事件。
-支持通过 query param 传递 JWT Token 进行认证。
+v2: 双向通信 — 客户端可发送用户干预指令控制搜索过程。
 """
 
 import json
@@ -14,10 +12,24 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from app.core.event_bus import event_bus
 from app.core.security import decode_access_token
+from app.core.user_action_handler import UserActionHandler
 
 logger = structlog.get_logger()
 
 router = APIRouter()
+_user_action_handler = UserActionHandler()
+
+
+def _get_active_state(task_id: str) -> dict | None:
+    """获取当前运行中任务的 LATSState"""
+    from app.services import agent_runner as agent_runner_module
+    runner = agent_runner_module.agent_runner
+    if runner is None:
+        return None
+    # 通过 agent_runner 获取当前运行状态
+    if hasattr(runner, '_active_states'):
+        return runner._active_states.get(task_id)
+    return None
 
 
 @router.websocket("/ws/tasks/{task_id}/stream")
@@ -27,21 +39,23 @@ async def task_event_stream(
     token: Optional[str] = Query(default=None),
 ) -> None:
     """
-    WebSocket 端点：实时推送任务事件流。
+    WebSocket 端点 (v2 双向): 实时推送任务事件流 + 接收用户干预指令。
 
-    认证方式：
-    - 通过 query param ?token=<jwt> 传递 JWT Token
-    - Token 无效时关闭连接（code=4001）
-    - Token 缺失时允许连接（方便开发调试，生产环境应强制认证）
+    上行 (Client → Server):
+      {"type": "user_action", "action": "create_branch"|"mark_false_positive"|...,
+       "params": {...}}
 
-    连接流程：
-    1. 客户端连接 ws://<host>/api/v1/ws/tasks/{task_id}/stream?token=xxx
-    2. 验证 Token（如有）
-    3. 服务端接受连接并注册事件回调
-    4. 任务产生新事件时自动推送 {"type": "event", "data": {...}}
-    5. 客户端可发送 {"action": "ping"} 进行心跳检测
+      {"type": "ping"}
+
+    下行 (Server → Client):
+      {"type": "event", "data": {...}}
+
+      {"type": "pong"}
+
+      {"type": "user_action_ack", "action": "...", "status": "applied"|"rejected",
+       "reason": "...", "data": {...}}
     """
-    # Token 验证（如有）
+    # Token 验证
     if token:
         payload = decode_access_token(token)
         if payload is None:
@@ -52,12 +66,9 @@ async def task_event_stream(
     logger.info("ws_client_connected", task_id=task_id)
 
     async def send_event(event: dict) -> None:
-        """回调函数：收到事件总线推送的事件时转发给 WebSocket 客户端"""
+        """回调：收到事件总线推送时转发给 WebSocket 客户端"""
         try:
-            await websocket.send_json({
-                "type": "event",
-                "data": event,
-            })
+            await websocket.send_json({"type": "event", "data": event})
         except Exception:
             pass
 
@@ -69,10 +80,50 @@ async def task_event_stream(
             data = await websocket.receive_text()
             try:
                 msg = json.loads(data)
-                if msg.get("action") == "ping":
-                    await websocket.send_json({"type": "pong"})
             except json.JSONDecodeError:
-                pass
+                await websocket.send_json({
+                    "type": "user_action_ack",
+                    "status": "rejected",
+                    "reason": "无效的 JSON",
+                })
+                continue
+
+            msg_type = msg.get("type", "")
+
+            if msg_type == "ping":
+                await websocket.send_json({"type": "pong"})
+
+            elif msg_type == "user_action":
+                action = msg.get("action", "")
+                params = msg.get("params", {})
+
+                # 查找当前任务状态
+                state = _get_active_state(task_id)
+                if state is None:
+                    await websocket.send_json({
+                        "type": "user_action_ack",
+                        "action": action,
+                        "status": "rejected",
+                        "reason": "任务状态不可用（任务可能未在运行）",
+                    })
+                    continue
+
+                result = await _user_action_handler.handle(action, params, state)
+                await websocket.send_json({
+                    "type": "user_action_ack",
+                    "action": action,
+                    "status": result.get("status", "rejected"),
+                    "reason": result.get("reason", ""),
+                    "data": result.get("data", {}),
+                })
+
+            else:
+                await websocket.send_json({
+                    "type": "user_action_ack",
+                    "status": "rejected",
+                    "reason": f"未知消息类型: {msg_type}",
+                })
+
     except WebSocketDisconnect:
         logger.info("ws_client_disconnected", task_id=task_id)
     finally:

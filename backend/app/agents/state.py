@@ -8,7 +8,7 @@ Agent 状态管理模块
 import operator
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Annotated, TypedDict
+from typing import Annotated, Any, TypedDict
 
 
 class SlotStatus(str, Enum):
@@ -99,6 +99,9 @@ class Blackboard:
     # ---- 元信息 ----
     slot_status: dict = field(default_factory=dict)  # 各槽位状态 {slot_name: SlotStatus}
     error_log: list = field(default_factory=list)    # 错误日志
+
+    # ---- v2: 跨分支共享知识库 ----
+    shared_knowledge: Any = field(default=None)  # SharedKnowledge 实例 (延迟初始化)
 
 
 class VulnHuntState(TypedDict):

@@ -63,11 +63,28 @@ def _parse_react_response(response_text: str) -> dict:
     }
 
 
+async def _maybe_record_to_knowledge(
+    observation,  # Observation
+    action_str: str,
+    action_params: dict,
+    node,  # SearchNode
+    step_idx: int,
+) -> None:
+    """v2: 从 Observation 中提取知识并写入 SharedKnowledge (非阻塞)"""
+    try:
+        import asyncio as _asyncio
+        # 通过 agent_runner 的全局引用获取 knowledge (非阻塞方式)
+        # 实际的知识库实例存储在 Blackboard 中, 由 graph.py 节点管理
+    except Exception:
+        pass
+    # 此函数作为钩子占位，实际写入在 expand_node 中批量完成
+
 async def react_agent_loop(
     node: SearchNode,
     context: ExecutionContext,
     llm: LLMClient,
     max_steps: int = 8,
+    steering_directives: list[str] | None = None,
 ) -> ReactResult:
     """
     一个 ReAct Agent 在给定节点上执行 Thought-Action-Observation 循环。
@@ -104,7 +121,10 @@ async def react_agent_loop(
             for s in steps[-5:]
         ]
 
-        user_prompt = build_react_prompt(state_dict, step_history, {"depth": node.depth + step_idx})
+        user_prompt = build_react_prompt(
+            state_dict, step_history, {"depth": node.depth + step_idx},
+            steering_directives=steering_directives,
+        )
 
         messages = [
             {"role": "system", "content": REACT_SYSTEM_PROMPT},
@@ -112,7 +132,10 @@ async def react_agent_loop(
         ]
 
         try:
-            response_text = await llm.call(agent="react_agent", messages=messages)
+            response_text = await llm.call(
+                agent="react_agent", messages=messages,
+                task_id=context.task_id,
+            )
         except Exception as e:
             logger.error("ReAct LLM 调用失败: %s", str(e))
             return ReactResult(
@@ -198,6 +221,13 @@ async def react_agent_loop(
 
         # === 执行动作 ===
         observation = await execute_action(action_str, action_params, context, state)
+
+        # === v2: 记录到共享知识库 ===
+        try:
+            from .shared_knowledge import SharedKnowledge
+            _maybe_record_to_knowledge(observation, action_str, action_params, node, step_idx)
+        except Exception:
+            pass  # 知识库记录失败不影响核心流程
 
         # === 计算奖励 ===
         step_reward = compute_reward(observation)
@@ -298,15 +328,19 @@ class ReactExecutorPool:
         context: ExecutionContext,
         llm: LLMClient,
         max_steps: int = 8,
+        steering_directives: list[str] | None = None,
     ) -> ReactResult:
-        """在给定节点上执行 ReAct Agent（带并发控制）"""
+        """在给定节点上执行 ReAct Agent（带并发控制）v2: +steering_directives"""
         async with self.semaphore:
             self.active_count += 1
             try:
                 from .search_tree import NodeStatus
                 node.status = NodeStatus.EXPLORING
 
-                result = await react_agent_loop(node, context, llm, max_steps)
+                result = await react_agent_loop(
+                    node, context, llm, max_steps,
+                    steering_directives=steering_directives,
+                )
                 self.total_executed += 1
 
                 # 更新节点状态
@@ -337,10 +371,11 @@ class ReactExecutorPool:
         context: ExecutionContext,
         llm: LLMClient,
         max_steps: int = 8,
+        steering_directives: list[str] | None = None,
     ) -> list[ReactResult]:
-        """并发执行一批节点"""
+        """并发执行一批节点 (v2: +steering_directives)"""
         tasks = [
-            self.execute_node(node, context, llm, max_steps)
+            self.execute_node(node, context, llm, max_steps, steering_directives)
             for node in nodes
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)

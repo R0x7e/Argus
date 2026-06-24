@@ -16,46 +16,56 @@ from .base import BaseTool, ExecutionContext, RiskLevel
 
 logger = logging.getLogger(__name__)
 
-# 默认路径字典（覆盖常见敏感路径和管理入口）
+# 默认路径字典 v2-fix: 从 59 条扩展到 ~140 条
 DEFAULT_WORDLIST = [
-    ".git",
-    ".git/config",
-    ".env",
-    ".DS_Store",
-    ".htaccess",
-    "robots.txt",
-    "sitemap.xml",
-    "admin",
-    "api",
-    "login",
-    "register",
-    "dashboard",
-    "config",
-    "backup",
-    ".well-known",
-    ".well-known/security.txt",
-    "swagger",
-    "swagger-ui.html",
-    "docs",
-    "graphql",
-    "actuator",
-    "actuator/health",
-    "actuator/env",
-    "health",
-    "debug",
-    "console",
-    "phpinfo.php",
-    "wp-admin",
-    "wp-login.php",
-    "server-status",
-    "server-info",
-    "elmah.axd",
-    "trace.axd",
-    "api/v1",
-    "api/v2",
-    "api/docs",
-    "api/swagger.json",
-    "api/openapi.json",
+    # ── 版本控制 & 配置文件 ──
+    ".git", ".git/config", ".git/HEAD", ".svn/entries", ".hg/",
+    ".env", ".env.backup", ".env.local", ".env.production",
+    ".DS_Store", ".htaccess", ".htpasswd",
+    "web.config", "config.yml", "config.yaml", "config.json",
+    "docker-compose.yml", "Dockerfile", ".dockerignore",
+    ".gitlab-ci.yml", "Jenkinsfile", ".travis.yml",
+    # ── 通用入口 ──
+    "robots.txt", "sitemap.xml",
+    "admin", "api", "login", "register", "signup", "signin",
+    "dashboard", "config", "backup", "backups", "old",
+    "debug", "console", "status", "health", "ping",
+    ".well-known", ".well-known/security.txt",
+    # ── 备份文件后缀 ──
+    ".bak", "index.php.bak", "index.html.bak", ".old", ".swp", ".save", ".orig",
+    "~", "index.php~", "index.html~",
+    # ── Swagger / API 文档 ──
+    "swagger", "swagger-ui.html", "swagger.json",
+    "swagger/v1/swagger.json", "swagger/v2/swagger.json",
+    "openapi.json", "openapi.yaml",
+    "docs", "api/docs", "api-docs",
+    "api/v1", "api/v2", "api/v3",
+    "api/swagger.json", "api/openapi.json",
+    "v1", "v2", "v3",
+    # ── GraphQL ──
+    "graphql", "graphiql", "playground",
+    # ── Spring / Java ──
+    "actuator", "actuator/health", "actuator/env", "actuator/mappings",
+    "actuator/info", "actuator/metrics", "actuator/beans",
+    "invoker/JMXInvokerServlet", "jmx-console", "web-console",
+    # ── PHP ──
+    "phpinfo.php", "phpmyadmin", "info.php", "test.php",
+    "wp-admin", "wp-login.php", "wp-content", "wp-json",
+    "wp-config.php", "wp-config.php.bak", "wp-config.bak",
+    # ── 常见框架路径 ──
+    "api/users", "api/auth", "api/login", "api/admin",
+    "/api/user", "/api/account",
+    "admin/login", "admin/users",
+    # ── 服务器信息 ──
+    "server-status", "server-info",
+    "elmah.axd", "trace.axd",
+    # ── 常见文件 ──
+    "crossdomain.xml", "clientaccesspolicy.xml",
+    "sitemap.xml.gz", "favicon.ico",
+    "README.md", "CHANGELOG.md", "LICENSE",
+    # ── 静态资源探测 ──
+    "static", "assets", "public", "uploads", "files", "downloads",
+    "images", "css", "js", "img",
 ]
 
 

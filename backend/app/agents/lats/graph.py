@@ -1,10 +1,14 @@
 """
-LATS LangGraph 图构建
+LATS LangGraph 图构建 (v2)
 
 构建 LATS + ReAct 混合架构的状态图：
-Recon → Init Tree → [MCTS Select → Expand → React Execute → Backprop → Evaluate] (循环) → Reporter
+Recon → Init Tree → [MCTS Select → React Execute → Expand → Evaluate] (循环) → Reporter
 
-替换原有的固定管线循环，实现真正的搜索驱动漏洞挖掘。
+v2 新增:
+- expand_node: 发现驱动的动态扩展引擎 + 共享知识库集成
+- mcts_select 使用自适应多因素选择 (select_batch API)
+- Cold start 逻辑 (前 2 周期直接选种子)
+- SharedKnowledge 跨分支信息共享
 """
 
 import json
@@ -19,9 +23,12 @@ from langgraph.graph import END, StateGraph
 
 from app.agents.emit import emit
 from app.agents.llm import LLMClient
+from app.agents.lats.expansion_engine import ExpansionEngine, Discovery, DiscoveryType
+from app.agents.lats.multi_level_prober import BatchProber, QuickProber
 from app.agents.lats.react_executor import ReactExecutorPool, ReactResult
 from app.agents.lats.reward import compute_reward, estimate_branch_value, infer_vuln_types
 from app.agents.lats.search_tree import NodeState, NodeStatus, SearchNode, SearchTree
+from app.agents.lats.shared_knowledge import SharedKnowledge
 from app.agents.state import Blackboard, VulnFinding
 from app.tools.base import ExecutionContext
 
@@ -29,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 _llm_client: LLMClient | None = None
 _executor_pool: ReactExecutorPool | None = None
+_expansion_engine: ExpansionEngine | None = None
 
 
 def _get_llm_client() -> LLMClient:
@@ -45,10 +53,17 @@ def _get_executor_pool() -> ReactExecutorPool:
     return _executor_pool
 
 
-# ──── LATS State Definition ────
+def _get_expansion_engine() -> ExpansionEngine:
+    global _expansion_engine
+    if _expansion_engine is None:
+        _expansion_engine = ExpansionEngine()
+    return _expansion_engine
+
+
+# ──── LATS State Definition (v2) ────
 
 class LATSState(TypedDict):
-    """LATS 架构的状态定义（LangGraph TypedDict）"""
+    """LATS 架构的状态定义（LangGraph TypedDict）v2 扩展"""
     blackboard: Blackboard
     search_tree: Any
     current_cycle: int
@@ -60,6 +75,10 @@ class LATSState(TypedDict):
     dry_cycles: int
     selected_nodes: list
     react_results: list
+    # v2: 动态扩展 + 共享知识
+    expansion_candidates: list
+    discoveries: list
+    expansion_stats: dict
 
 
 # ──── Node: Recon ────
@@ -74,9 +93,12 @@ async def lats_recon_node(state: dict) -> dict:
     target_url = task_config.get("target_url", "")
     bb = state["blackboard"]
 
+    # v2: 初始化共享知识库
+    if bb.shared_knowledge is None:
+        bb.shared_knowledge = SharedKnowledge()
+
     await emit(task_id, "lats_recon", "agent_started", {"node": "recon"})
 
-    # 执行侦察
     recon_results = await _run_reconnaissance(state)
 
     await emit(task_id, "lats_recon", "recon_complete", {
@@ -86,7 +108,6 @@ async def lats_recon_node(state: dict) -> dict:
         "forms_found": len(recon_results.get("forms", [])),
     })
 
-    # LLM 分析生成画像
     llm = _get_llm_client()
     messages = [
         {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT},
@@ -105,7 +126,6 @@ async def lats_recon_node(state: dict) -> dict:
 
     response_text = await llm.call(agent="orchestrator", messages=messages)
 
-    # 解析
     try:
         decision = json.loads(response_text)
     except json.JSONDecodeError:
@@ -116,13 +136,11 @@ async def lats_recon_node(state: dict) -> dict:
         except Exception:
             decision = {}
 
-    # 构建 blackboard
     target_profile = decision.get("target_profile", {})
     target_profile["base_url"] = target_url
     bb.target_profile = target_profile
 
     attack_surface = decision.get("attack_surface", {})
-    # 合并工具发现的端点
     tool_endpoints = [{"path": d, "source": "dir_scan"} for d in recon_results.get("directories", [])[:20]]
     param_endpoints = []
     for p in recon_results.get("parameters", [])[:30]:
@@ -139,6 +157,27 @@ async def lats_recon_node(state: dict) -> dict:
     attack_surface["forms"] = recon_results.get("forms", [])[:20]
     bb.attack_surface = attack_surface
 
+    # v2: 将侦察发现的端点初始录入 SharedKnowledge
+    for ep_data in attack_surface.get("endpoints", [])[:50]:
+        if isinstance(ep_data, dict):
+            path = ep_data.get("path", "")
+            method = ep_data.get("method", "GET")
+            source = ep_data.get("source", "recon")
+        elif isinstance(ep_data, str):
+            path = ep_data
+            method = "GET"
+            source = "recon"
+        else:
+            continue
+        if path and bb.shared_knowledge:
+            try:
+                import asyncio
+                asyncio.ensure_future(
+                    bb.shared_knowledge.record_endpoint(path=path, method=method, source=source)
+                )
+            except Exception:
+                pass
+
     await emit(task_id, "lats_recon", "agent_stopped", {"node": "recon"})
 
     return {
@@ -153,10 +192,111 @@ async def lats_recon_node(state: dict) -> dict:
     }
 
 
-# ──── Node: Init Tree ────
+# ──── v5: URL 语义解析 — 从 URL 路径推断参数和漏洞类型 ────
+
+def _infer_vuln_from_path(path: str) -> list[str]:
+    """从 URL 路径名推断可能的漏洞类型，不依赖参数发现"""
+    path_lower = path.lower()
+    types = []
+    kw_map = {
+        "sqli": "sql_injection", "sql": "sql_injection",
+        "xss": "xss", "cross": "xss",
+        "upload": "file_upload", "file": "lfi",
+        "admin": "auth_bypass", "manage": "auth_bypass",
+        "api": "idor", "search": "xss", "query": "sql_injection",
+        "login": "auth_bypass", "signin": "auth_bypass", "auth": "auth_bypass",
+        "redirect": "open_redirect", "callback": "ssrf",
+        "download": "path_traversal", "exec": "rce", "cmd": "rce",
+        "burteforce": "auth_bypass", "bf_": "auth_bypass",
+        "user": "idor", "account": "idor", "order": "idor",
+        "overpermission": "idor", "idor": "idor",
+    }
+    for kw, vt in kw_map.items():
+        if kw in path_lower and vt not in types:
+            types.append(vt)
+    if not types:
+        types = ["info_disclosure", "auth_bypass"]
+    return types
+
+
+def _is_endpoint_injectable(path: str) -> bool:
+    """v9: 判断端点是否可能接受参数注入 (排除静态文件/配置/版本控制)"""
+    path_lower = path.lower()
+    static_suffixes = ('.git', '.ds_store', '.md', '.css', '.js', '.png', '.jpg',
+                       '.jpeg', '.gif', '.svg', '.ico', '.woff', '.ttf', '.txt')
+    static_names = ('.env', '.htaccess', '.htpasswd', 'dockerfile', 'docker-compose.yml',
+                    '.svn', '.hg', '.bzr', 'license', 'readme', 'changelog',
+                    'robots.txt', 'sitemap', 'favicon')
+    if any(path_lower.endswith(s) for s in static_suffixes):
+        return False
+    if any(s in path_lower for s in static_names):
+        return False
+    return True
+
+
+def _infer_params_from_url(url: str) -> list[dict]:
+    """从 URL 文件名模式推断可能的参数名和漏洞类型"""
+    import re as _re
+    params = []
+    path = url.split("?")[0]
+    filename = path.rsplit("/", 1)[-1] if "/" in path else path
+    name_lower = filename.lower()
+
+    # 文件名拆词: sqli_id → [sqli, id]; bf_client → [bf, client]
+    words = _re.split(r'[_.-]', name_lower)
+    words = [w for w in words if w and len(w) > 1]
+
+    param_hints = {
+        "id": ["idor", "sql_injection", "xss"],
+        "user": ["idor", "auth_bypass"],
+        "search": ["xss", "sql_injection"],
+        "query": ["sql_injection", "xss"],
+        "name": ["xss", "sql_injection"],
+        "file": ["lfi", "path_traversal"],
+        "page": ["lfi", "path_traversal"],
+        "url": ["ssrf", "open_redirect"],
+        "cmd": ["rce"],
+        "exec": ["rce"],
+        "login": ["auth_bypass", "sql_injection"],
+        "client": ["idor", "auth_bypass"],
+        "server": ["ssrf", "auth_bypass"],
+        "form": ["xss", "sql_injection", "auth_bypass"],
+        "upload": ["file_upload", "rce"],
+        "download": ["path_traversal"],
+        "admin": ["auth_bypass"],
+    }
+
+    for word in words:
+        if word in param_hints:
+            params.append({
+                "name": word,
+                "vuln_types": param_hints[word],
+                "source": "url_inferred",
+            })
+
+    # 如果 URL 有 query string，直接提取参数
+    if "?" in url:
+        from urllib.parse import parse_qs, urlparse as _urlparse
+        try:
+            parsed = _urlparse(url)
+            for pname in parse_qs(parsed.query).keys():
+                if pname not in [p["name"] for p in params]:
+                    from app.agents.lats.reward import infer_vuln_types
+                    params.append({
+                        "name": pname,
+                        "vuln_types": infer_vuln_types(pname, path),
+                        "source": "url_query",
+                    })
+        except Exception:
+            pass
+
+    return params
+
+
+# ──── Node: Init Tree (v2: 使用 SEED 状态) ────
 
 async def lats_init_tree_node(state: dict) -> dict:
-    """初始化搜索树 — 将攻击面转换为初始分支"""
+    """初始化搜索树 — 将攻击面转换为初始分支 (v2: 标记为 SEED)"""
     bb = state["blackboard"]
     task_id = state["task_id"]
     attack_surface = bb.attack_surface or {}
@@ -167,7 +307,6 @@ async def lats_init_tree_node(state: dict) -> dict:
 
     tree = SearchTree()
 
-    # 创建根节点
     root = SearchNode(
         id="root",
         parent_id=None,
@@ -178,16 +317,20 @@ async def lats_init_tree_node(state: dict) -> dict:
             current_param=None,
             vuln_type="",
         ),
-        status=NodeStatus.NEEDS_EXPANSION,
+        status=NodeStatus.EXPLORING,  # v5: 根节点不应被选中执行
     )
     tree.set_root(root)
 
-    # 为每个 (端点, 参数, 漏洞类型) 组合创建分支
+    # v5: URL 语义推断 + 随机抖动打破同质化
+    import random as _random
+    target_path = target_url.split("?")[0] if target_url else ""
+    url_inferred_params = _infer_params_from_url(target_url) if target_url else []
+    url_inferred_vulns = _infer_vuln_from_path(target_path) if target_path else []
+
     branches_created = 0
     seen_branches = set()
 
     for endpoint in attack_surface.get("endpoints", []):
-        # 兼容字符串格式的端点（LLM 可能返回纯路径字符串）
         if isinstance(endpoint, str):
             endpoint = {"path": endpoint, "params": [], "source": "llm"}
         path = endpoint.get("path", "")
@@ -197,64 +340,147 @@ async def lats_init_tree_node(state: dict) -> dict:
         if not path:
             continue
 
-        # 没有参数的端点 → 尝试 info_disclosure / auth_bypass
         if not params:
             for vtype in ["info_disclosure", "auth_bypass"]:
                 branch_key = f"{vtype}@{path}"
                 if branch_key in seen_branches:
                     continue
                 seen_branches.add(branch_key)
-
                 value = estimate_branch_value(vtype, "", path, tech_stack, source)
-                tree.create_child_node(
-                    parent=root,
-                    action="explore",
+                value += _random.uniform(-0.05, 0.05)  # v5: 打破同质化
+                value = max(0.05, min(1.0, value))
+                child = tree.create_child_node(
+                    parent=root, action="explore",
                     action_params={"endpoint": path, "vuln_type": vtype},
-                    vuln_type=vtype,
-                    endpoint=path,
-                    param=None,
-                    value_estimate=value,
+                    vuln_type=vtype, endpoint=path, param=None,
+                    value_estimate=value, created_at_cycle=0,
                 )
+                child.status = NodeStatus.SEED  # v2
                 branches_created += 1
 
-        # 有参数的端点 → 推断漏洞类型
         for param in params:
             param_name = param if isinstance(param, str) else param.get("name", "")
             vuln_types = infer_vuln_types(param_name, endpoint, tech_stack)
-
             for vtype in vuln_types:
                 branch_key = f"{vtype}@{path}:{param_name}"
                 if branch_key in seen_branches:
                     continue
                 seen_branches.add(branch_key)
-
                 value = estimate_branch_value(vtype, param_name, path, tech_stack, source)
-                tree.create_child_node(
-                    parent=root,
-                    action="explore",
+                value += _random.uniform(-0.05, 0.05)  # v5: 打破同质化
+                value = max(0.05, min(1.0, value))
+                child = tree.create_child_node(
+                    parent=root, action="explore",
                     action_params={"endpoint": path, "param": param_name, "vuln_type": vtype},
-                    vuln_type=vtype,
-                    endpoint=path,
-                    param=param_name,
-                    value_estimate=value,
+                    vuln_type=vtype, endpoint=path, param=param_name,
+                    value_estimate=value, created_at_cycle=0,
                 )
+                child.status = NodeStatus.SEED  # v2
                 branches_created += 1
 
-    # 限制初始分支数量（优先高价值分支）
-    if branches_created > 60:
-        children_nodes = [tree.get_node(cid) for cid in root.children]
-        children_nodes.sort(key=lambda n: n.value_estimate, reverse=True)
-        for node in children_nodes[60:]:
+    # v5: 为 URL 推断参数创建分支 (打破 auth_bypass 垄断)
+    for inferred in url_inferred_params:
+        pname = inferred["name"]
+        for vtype in inferred["vuln_types"][:3]:
+            for ep_data in attack_surface.get("endpoints", [])[:1]:
+                path = ep_data if isinstance(ep_data, str) else ep_data.get("path", "")
+                if not path or path.startswith("http://127.0.0.1"):
+                    path = target_path or "/"
+                branch_key = f"{vtype}@{path}:{pname}"
+                if branch_key in seen_branches:
+                    continue
+                seen_branches.add(branch_key)
+                value = estimate_branch_value(vtype, pname, path, tech_stack, "url_inferred")
+                value += _random.uniform(-0.05, 0.05)  # v5: 随机抖动打破同质化
+                value = max(0.05, min(1.0, value))
+                child = tree.create_child_node(
+                    parent=root, action="explore_inferred",
+                    action_params={"endpoint": path, "param": pname, "vuln_type": vtype},
+                    vuln_type=vtype, endpoint=path, param=pname,
+                    value_estimate=value, created_at_cycle=0,
+                )
+                child.status = NodeStatus.SEED
+                branches_created += 1
+
+    # v8: Fallback — 为每个可注入端点强制创建注入探测分支 (v9: 过滤静态文件)
+    fallback_params = ["id", "q", "file", "url", "cmd", "name", "page"]
+    for endpoint_data in attack_surface.get("endpoints", [])[:10]:
+        path = endpoint_data if isinstance(endpoint_data, str) else endpoint_data.get("path", "")
+        if not path or path.startswith("http://127"):
+            path = target_path or "/"
+        # v9: 仅为可注入端点创建 RCE/LFI/SQLi 分支
+        if not _is_endpoint_injectable(path):
+            continue
+        for fb_param in fallback_params:
+            fb_vuln_map = {
+                "id": ["sql_injection", "idor", "xss"],
+                "q": ["xss", "sql_injection"],
+                "file": ["lfi", "path_traversal"],
+                "url": ["ssrf", "open_redirect"],
+                "cmd": ["rce"],
+                "name": ["xss", "sql_injection"],
+                "page": ["lfi", "path_traversal"],
+            }
+            for vt in fb_vuln_map.get(fb_param, ["sql_injection"])[:2]:
+                bk = f"{vt}@{path}:{fb_param}"
+                if bk in seen_branches:
+                    continue
+                seen_branches.add(bk)
+                val = max(0.3, estimate_branch_value(vt, fb_param, path, tech_stack, "fallback") - 0.15)
+                val += _random.uniform(-0.03, 0.03)
+                child = tree.create_child_node(
+                    parent=root, action="explore_fallback",
+                    action_params={"endpoint": path, "param": fb_param, "vuln_type": vt},
+                    vuln_type=vt, endpoint=path, param=fb_param,
+                    value_estimate=max(0.1, min(1.0, val)), created_at_cycle=0,
+                )
+                child.status = NodeStatus.LOW_SIGNAL  # 低优先级, 预算宽松时执行
+                branches_created += 1
+
+    # v5: 为 URL 推断的漏洞类型创建分支 (即使无参)
+    for vtype in url_inferred_vulns[:4]:
+        branch_key = f"{vtype}@{target_path}"
+        if branch_key in seen_branches:
+            continue
+        seen_branches.add(branch_key)
+        value = estimate_branch_value(vtype, "", target_path, tech_stack, "url_inferred")
+        value += _random.uniform(-0.05, 0.05)
+        value = max(0.05, min(1.0, value))
+        child = tree.create_child_node(
+            parent=root, action="explore_inferred",
+            action_params={"endpoint": target_path, "vuln_type": vtype},
+            vuln_type=vtype, endpoint=target_path, param=None,
+            value_estimate=value, created_at_cycle=0,
+        )
+        child.status = NodeStatus.SEED
+        branches_created += 1
+
+    # v9: 分层剪枝 — SEED/PROMOTED/HIGH_SIGNAL 不剪, 仅对 LOW_SIGNAL 排序剪枝
+    if branches_created > 120:
+        all_children = [tree.get_node(cid) for cid in root.children]
+        # 先保留高优先级节点
+        keep = [n for n in all_children if n and n.status in (
+            NodeStatus.SEED, NodeStatus.PROMOTED, NodeStatus.HIGH_SIGNAL,
+        )]
+        remaining_slots = 120 - len(keep)
+        # 对 LOW_SIGNAL 节点按 val 排序, 保留前 remaining_slots 个
+        low_sig = [n for n in all_children if n and n.status == NodeStatus.LOW_SIGNAL]
+        low_sig.sort(key=lambda n: n.value_estimate, reverse=True)
+        keep_ids = {n.id for n in keep}
+        # Prune LOW_SIGNAL beyond limit
+        for node in low_sig[remaining_slots:]:
             tree.prune_node(node.id)
+        pruned_count = max(0, branches_created - 120)
+    else:
+        pruned_count = 0
 
     await emit(task_id, "lats_init", "tree_initialized", {
         "branches": branches_created,
-        "pruned_to": min(branches_created, 60),
+        "pruned_to": min(branches_created, 120),
     })
-
     await emit(task_id, "lats_init", "agent_stopped", {"node": "init_tree"})
 
-    logger.info("搜索树初始化完成: %d 分支", branches_created)
+    logger.info("搜索树初始化完成: %d 分支 (v2 SEED 状态)", branches_created)
 
     return {
         "search_tree": tree,
@@ -269,28 +495,51 @@ async def lats_init_tree_node(state: dict) -> dict:
     }
 
 
-# ──── Node: MCTS Select ────
+# ──── Node: MCTS Select (v2: 自适应多因素选择) ────
 
 async def lats_mcts_select_node(state: dict) -> dict:
-    """MCTS 选择 — 用 UCB1 选择最有价值的叶节点"""
+    """MCTS 选择 (v2: 自适应多因素选择 + cold start)"""
     tree: SearchTree = state["search_tree"]
     task_id = state["task_id"]
     pool = _get_executor_pool()
+    cycle = state.get("current_cycle", 0)
 
-    await emit(task_id, "lats_mcts", "agent_started", {"node": "mcts_select"})
+    await emit(task_id, "lats_mcts", "agent_started", {"node": "mcts_select", "cycle": cycle})
 
     batch_size = pool.max_concurrent
-    selected = tree.select_batch(batch_size)
+    selected = tree.select_batch(
+        batch_size=batch_size,
+        current_cycle=cycle,
+        cold_start_until_cycle=2,
+    )
 
-    selected_info = [
-        {"id": n.id[:8], "type": n.state.vuln_type, "endpoint": n.state.current_endpoint, "value": round(n.value_estimate, 2)}
-        for n in selected
-    ]
+    selected_info = []
+    for n in selected:
+        parent = tree.get_node(n.parent_id) if n.parent_id else None
+        score = tree._adaptive_selection_score(n, parent)
+        info = {
+            "id": n.id[:8], "type": n.state.vuln_type,
+            "endpoint": n.state.current_endpoint,
+            "value": round(n.value_estimate, 2),
+            "empirical": round(n.empirical_value, 2),
+            "status": n.status.value, "visits": n.visit_count,
+            "score": round(score, 3),
+            "score_breakdown": {
+                "exploitation": round(tree._exploitation_weight(tree.global_step) * tree._wilson_score_lower_bound(n), 3),
+                "exploration": round(tree._exploration_weight(tree.global_step) * (2.0 * __import__('math').exp(-tree.global_step / tree.total_expected_steps) * __import__('math').sqrt(__import__('math').log(max(1, parent.visit_count if parent else 1)) / max(1, n.visit_count))) if n.visit_count > 0 else 0, 3),
+                "prior": round(tree._prior_weight(tree.global_step) * n.value_estimate, 3),
+                "diversity": round(tree.DIVERSITY_WEIGHT * tree._diversity_score(n), 3),
+                "recency": round(tree.RECENCY_WEIGHT * tree._recency_score(n), 3),
+            },
+        }
+        selected_info.append(info)
 
     await emit(task_id, "lats_mcts", "nodes_selected", {
-        "count": len(selected),
-        "nodes": selected_info,
+        "count": len(selected), "nodes": selected_info,
         "selection_path": [n.id for n in selected],
+        "cold_start": cycle <= 2,
+        "prior_weight": round(tree._prior_weight(tree.global_step), 4),
+        "exploration_weight": round(tree._exploration_weight(tree.global_step), 4),
     })
 
     await emit(task_id, "lats_mcts", "agent_stopped", {"node": "mcts_select"})
@@ -314,6 +563,7 @@ async def lats_react_execute_node(state: dict) -> dict:
     tree: SearchTree = state["search_tree"]
     task_id = state["task_id"]
     bb = state["blackboard"]
+    task_config = state.get("task_config", {}) or {}
     selected_ids = state.get("selected_nodes", [])
 
     await emit(task_id, "lats_react", "agent_started", {"node": "react_execute", "batch_size": len(selected_ids)})
@@ -322,21 +572,19 @@ async def lats_react_execute_node(state: dict) -> dict:
         await emit(task_id, "lats_react", "agent_stopped", {"node": "react_execute"})
         return {"react_results": [], "events": []}
 
-    # 构建执行上下文
     target_profile = bb.target_profile or {}
     base_url = target_profile.get("base_url", "")
     parsed = urlparse(base_url)
     host = parsed.hostname or "localhost"
 
     context = ExecutionContext(
-        task_id=task_id,
-        target_host=host,
-        timeout=30,
-        max_retries=2,
+        task_id=task_id, target_host=host, timeout=30, max_retries=2,
         allowed_hosts=[host],
+        auth_headers=task_config.get("auth_headers", {}),
+        cookies=task_config.get("cookies", {}),
+        auth_token=task_config.get("auth_token", ""),
     )
 
-    # 获取选中的节点
     nodes = [tree.get_node(nid) for nid in selected_ids if tree.get_node(nid)]
     nodes = [n for n in nodes if n and n.status != NodeStatus.EXHAUSTED]
 
@@ -344,9 +592,58 @@ async def lats_react_execute_node(state: dict) -> dict:
         await emit(task_id, "lats_react", "agent_stopped", {"node": "react_execute"})
         return {"react_results": [], "events": []}
 
-    # 动态决定每条路径的步数
+    # 提取 cycle 必须在 Level 0 探测之前，供后续 mark_promoted 等使用
     cycle = state.get("current_cycle", 0)
     max_cycles = state.get("max_cycles", 15)
+
+    # v2: Level 0 快速探测 — 对 SEED 节点执行 3 次廉价 HTTP 请求
+    seed_nodes = [n for n in nodes if n.status == NodeStatus.SEED]
+    if seed_nodes:
+        prober = BatchProber(max_concurrent=5)
+        probe_results = await prober.probe_batch(seed_nodes, context, base_url)
+        promoted_count = 0
+        killed_count = 0
+        low_signal_count = 0
+        for pr in probe_results:
+            node = tree.get_node(pr.node_id)
+            if not node:
+                continue
+            node.probe_level = 1
+            node.probe_results = [{
+                "verdict": pr.verdict,
+                "baseline_status": pr.baseline_status,
+                "probe_status": pr.probe_status,
+                "inject_status": pr.inject_status,
+                "signals": pr.signals,
+                "error": pr.error,
+            }]
+            # 更新经验价值
+            if pr.verdict == "promoted":
+                node.empirical_value = max(0.3, node.value_estimate)
+                tree.mark_promoted(node.id, cycle)
+                promoted_count += 1
+            elif pr.verdict == "killed":
+                node.empirical_value = -0.5
+                tree.mark_killed(node.id, reason=f"Level0: {pr.error or 'no_signal'}")
+                killed_count += 1
+            elif pr.verdict == "low_signal":
+                # v7: 降级保留 — 降低 prior, 标记为 LOW_SIGNAL, 预算宽松时可被选中
+                node.status = NodeStatus.LOW_SIGNAL
+                node.value_estimate = max(0.2, node.value_estimate - 0.2)
+                node.empirical_value = 0.0
+                low_signal_count += 1
+            else:
+                node.empirical_value = 0.0
+
+        await emit(task_id, "lats_react", "level0_probe_complete", {
+            "total": len(seed_nodes), "promoted": promoted_count,
+            "killed": killed_count, "low_signal": low_signal_count,
+        })
+
+        # 过滤: 只对 PROMOTED/HIGH_SIGNAL/NEEDS_EXPANSION 执行 Full ReAct
+        nodes = [n for n in nodes if n.status not in (NodeStatus.SEED, NodeStatus.KILLED)]
+
+    # 更新 remaining_ratio 基于已提取的 cycle/max_cycles
     remaining_ratio = 1.0 - (cycle / max(1, max_cycles))
 
     if remaining_ratio > 0.7:
@@ -358,12 +655,16 @@ async def lats_react_execute_node(state: dict) -> dict:
     else:
         max_steps = 3
 
-    # 并发执行
+    # v2: 提取用户 steering directives
+    steering_directives = bb.steering_directives if hasattr(bb, 'steering_directives') and bb.steering_directives else None
+
     pool = _get_executor_pool()
     llm = _get_llm_client()
-    results = await pool.execute_batch(nodes, context, llm, max_steps)
+    results = await pool.execute_batch(
+        nodes, context, llm, max_steps,
+        steering_directives=steering_directives,
+    )
 
-    # 处理结果
     events = []
     findings_this_round = []
 
@@ -372,11 +673,9 @@ async def lats_react_execute_node(state: dict) -> dict:
         if not node:
             continue
 
-        # 反向传播奖励
         tree.backpropagate(result.node_id, result.reward)
 
         if result.status == "finding" and result.finding:
-            # 确认漏洞
             tree.mark_confirmed(result.node_id)
             tree.record_finding(result.finding)
 
@@ -397,33 +696,20 @@ async def lats_react_execute_node(state: dict) -> dict:
             findings_this_round.append(finding)
 
             await emit(task_id, "lats_react", "finding_confirmed", {
-                "type": finding.type,
-                "severity": finding.severity,
+                "type": finding.type, "severity": finding.severity,
                 "endpoint": node.state.current_endpoint,
-                "param": node.state.current_param,
-                "steps": len(result.steps),
+                "param": node.state.current_param, "steps": len(result.steps),
             })
-
             events.append({
-                "id": str(uuid.uuid4()),
-                "agent": "lats_react",
-                "type": "finding_confirmed",
+                "id": str(uuid.uuid4()), "agent": "lats_react", "type": "finding_confirmed",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "data": {"type": finding.type, "severity": finding.severity},
             })
 
         elif result.status in ("exhausted", "backtrack"):
             tree.mark_exhausted(result.node_id)
-            await emit(task_id, "lats_react", "path_exhausted", {
-                "node": result.node_id[:8],
-                "vuln_type": node.state.vuln_type,
-                "endpoint": node.state.current_endpoint,
-                "steps": len(result.steps),
-                "reason": result.status,
-            })
 
         elif result.status == "step_limit":
-            # 步数耗尽但未确认 → 标记为需要扩展（下轮可能继续或放弃）
             if result.reward > 0.2:
                 node.status = NodeStatus.NEEDS_EXPANSION
             else:
@@ -436,31 +722,193 @@ async def lats_react_execute_node(state: dict) -> dict:
     })
 
     return {
-        "blackboard": bb,
-        "search_tree": tree,
-        "react_results": results,
-        "events": events,
+        "blackboard": bb, "search_tree": tree,
+        "react_results": results, "events": events,
     }
 
 
-# ──── Node: Evaluate ────
+# ──── Node: Expand (v2: 发现驱动的动态扩展 + 知识库记录) ────
+
+async def lats_expand_node(state: dict) -> dict:
+    """动态扩展节点 (v2): 提取发现 → 创建分支 → 写入知识库 → Graveyard 复活"""
+    tree: SearchTree = state["search_tree"]
+    bb = state["blackboard"]
+    task_id = state["task_id"]
+    cycle = state.get("current_cycle", 0)
+    react_results = state.get("react_results", [])
+    target_url = bb.target_profile.get("base_url", "") if bb.target_profile else ""
+
+    # 确保知识库已初始化
+    if bb.shared_knowledge is None:
+        bb.shared_knowledge = SharedKnowledge()
+    knowledge = bb.shared_knowledge
+
+    await emit(task_id, "lats_expand", "agent_started", {"node": "expand", "cycle": cycle})
+
+    engine = _get_expansion_engine()
+    extractor = engine.discovery_extractor
+
+    # 1. 从 ReAct 结果中提取发现
+    all_discoveries: list[Discovery] = []
+    for result in react_results:
+        if result is None:
+            continue
+        node = tree.get_node(result.node_id) if hasattr(result, 'node_id') else None
+        if node is None:
+            continue
+
+        react_discoveries = extractor.extract_from_react_result(result, node, cycle)
+        all_discoveries.extend(react_discoveries)
+
+        for tr in getattr(result, 'tool_results', []):
+            # v2-fix: 防御性检查 — tool_results 中可能混入非 dict 值
+            if not isinstance(tr, dict):
+                continue
+            # v9-fix: result 子字段也可能是字符串
+            tool_result_raw = tr.get('result', {})
+            if not isinstance(tool_result_raw, dict):
+                tool_result_raw = {}
+            tool_discoveries = extractor.extract_from_tool_result(
+                tool_name=tr.get('tool', ''),
+                tool_result=tool_result_raw,
+                node=node, cycle=cycle,
+            )
+            all_discoveries.extend(tool_discoveries)
+
+    unique_discoveries = _deduplicate_discoveries(all_discoveries)
+
+    # 2. 写入 SharedKnowledge (从 ReAct 结果 + 发现)
+    await _sync_discoveries_to_knowledge(knowledge, unique_discoveries, react_results, tree)
+
+    # 3. 执行扩展 (传入 knowledge 以启用 Graveyard 复活)
+    expansion_result = engine.expand(
+        tree=tree,
+        discoveries=unique_discoveries,
+        current_cycle=cycle,
+        base_url=target_url,
+        knowledge=knowledge,
+    )
+
+    tree_stats = tree.stats()
+
+    await emit(task_id, "lats_expand", "expansion_complete", {
+        **expansion_result,
+        "tree_stats": tree_stats,
+        "graveyard": tree.get_graveyard_stats(),
+        "knowledge_summary": knowledge.get_summary() if knowledge else {},
+    })
+
+    await emit(task_id, "lats_expand", "agent_stopped", {"node": "expand"})
+
+    return {
+        "search_tree": tree,
+        "discoveries": [d.data for d in unique_discoveries],
+        "expansion_stats": expansion_result,
+        "blackboard": bb,
+        "events": [{
+            "id": str(uuid.uuid4()),
+            "agent": "lats_expand",
+            "type": "expansion_complete",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": expansion_result,
+        }],
+    }
+
+
+async def _sync_discoveries_to_knowledge(
+    knowledge, discoveries: list, react_results: list, tree: SearchTree,
+) -> None:
+    """将本轮的发现同步到 SharedKnowledge (非阻塞)"""
+    import asyncio as _asyncio
+
+    for d in discoveries:
+        # v3-fix: data 防御 — d.data 可能为字符串
+        data = d.data if isinstance(d.data, dict) else {}
+        try:
+            if d.discovery_type == DiscoveryType.NEW_ENDPOINT:
+                await knowledge.record_endpoint(
+                    path=data.get("url", ""), method="GET",
+                    source=data.get("source", "react"),
+                )
+            elif d.discovery_type == DiscoveryType.NEW_PARAM:
+                await knowledge.record_param(
+                    param_name=data.get("param_name", ""),
+                    endpoint=data.get("endpoint", ""),
+                )
+            elif d.discovery_type == DiscoveryType.WAF_BYPASS_FOUND:
+                await knowledge.record_waf_rule(
+                    bypass_technique={"technique": str(data.get("filter_rules", ""))[:100]},
+                )
+            elif d.discovery_type == DiscoveryType.TECH_DISCOVERY:
+                await knowledge.record_tech_discovery(
+                    tech_name=data.get("tech_name", ""),
+                    source=data.get("evidence", "react"),
+                )
+            elif d.discovery_type == DiscoveryType.ERROR_LEAK:
+                await knowledge.record_vuln_signal(
+                    endpoint=data.get("endpoint", ""),
+                    param=data.get("param", ""),
+                    vuln_type="sql_injection",
+                    signal_type="error_leaked",
+                    confidence=0.6,
+                    evidence=data.get("observation", ""),
+                )
+        except Exception:
+            pass
+
+    # 从 ReAct 结果中记录探索历史
+    for result in react_results:
+        if result is None or not hasattr(result, 'node_id'):
+            continue
+        node = tree.get_node(result.node_id)
+        if node is None:
+            continue
+        try:
+            await knowledge.record_exploration(
+                node_id=result.node_id,
+                vuln_type=node.state.vuln_type,
+                endpoint=node.state.current_endpoint,
+                param=node.state.current_param,
+                result=result.status,
+                key_findings=getattr(result, 'new_facts', []),
+            )
+        except Exception:
+            pass
+
+
+def _deduplicate_discoveries(discoveries: list) -> list:
+    """去重：同类型、同 endpoint、同 param 只保留一个 (v2-fix: data 防御)"""
+    seen = set()
+    unique = []
+    for d in discoveries:
+        # v2-fix: data 可能是字符串(非 dict)的防御
+        data = d.data if isinstance(d.data, dict) else {}
+        endpoint = data.get('endpoint', data.get('url', ''))
+        param = data.get('param_name', '')
+        key = f"{d.discovery_type.value}@{endpoint}@{param}"
+        if key not in seen:
+            seen.add(key)
+            unique.append(d)
+    return unique
+
+
+# ──── Node: Evaluate (v2: 增强) ────
 
 async def lats_evaluate_node(state: dict) -> dict:
-    """评估节点 — 决定继续搜索还是生成报告"""
+    """评估节点 — 决定继续搜索还是生成报告 (v2: 考虑 Graveyard 复活)"""
     tree: SearchTree = state["search_tree"]
     bb = state["blackboard"]
     task_id = state["task_id"]
     cycle = state.get("current_cycle", 0)
     max_cycles = state.get("max_cycles", 15)
     results = state.get("react_results", [])
+    expansion_stats = state.get("expansion_stats", {})
 
     await emit(task_id, "lats_eval", "agent_started", {"node": "evaluate"})
 
-    # 计算本轮发现数
     findings_this_round = sum(1 for r in results if r.status == "finding")
     total_findings = len(bb.findings)
 
-    # 更新 dry_cycles
     dry_cycles = state.get("dry_cycles", 0)
     if findings_this_round > 0:
         dry_cycles = 0
@@ -478,29 +926,33 @@ async def lats_evaluate_node(state: dict) -> dict:
 
     tree_stats = tree.stats()
 
+    # v2: 知识库覆盖率统计
+    knowledge_stats = {}
+    if bb.shared_knowledge:
+        knowledge_stats = bb.shared_knowledge.get_coverage_stats()
+
     tree_snapshot = []
     for nid, n in tree.nodes.items():
         tree_snapshot.append({
-            "id": n.id,
-            "parent": n.parent_id,
+            "id": n.id, "parent": n.parent_id,
             "endpoint": n.state.current_endpoint,
             "vuln_type": n.state.vuln_type,
             "param": n.state.current_param,
             "value": round(n.average_reward, 3),
+            "empirical": round(n.empirical_value, 3),
             "visits": n.visit_count,
-            "status": n.status.value,
-            "depth": n.depth,
+            "status": n.status.value, "depth": n.depth,
         })
 
     await emit(task_id, "lats_eval", "cycle_summary", {
-        "cycle": cycle + 1,
-        "max_cycles": max_cycles,
+        "cycle": cycle + 1, "max_cycles": max_cycles,
         "findings_this_round": findings_this_round,
         "total_findings": total_findings,
-        "dry_cycles": dry_cycles,
-        "pruned": pruned,
-        "tree_stats": tree_stats,
-        "tree_snapshot": tree_snapshot,
+        "dry_cycles": dry_cycles, "pruned": pruned,
+        "tree_stats": tree_stats, "tree_snapshot": tree_snapshot,
+        "knowledge_stats": knowledge_stats,
+        "expansion_new_branches": expansion_stats.get("new_branches", 0),
+        "expansion_resurrected": expansion_stats.get("resurrected", 0),
     })
 
     await emit(task_id, "lats_eval", "agent_stopped", {"node": "evaluate"})
@@ -510,6 +962,7 @@ async def lats_evaluate_node(state: dict) -> dict:
         "dry_cycles": dry_cycles,
         "search_tree": tree,
         "blackboard": bb,
+        "expansion_stats": expansion_stats,
         "events": [{
             "id": str(uuid.uuid4()),
             "agent": "lats_eval",
@@ -520,34 +973,34 @@ async def lats_evaluate_node(state: dict) -> dict:
     }
 
 
-# ──── Routing ────
+# ──── Routing (v2) ────
 
 def route_from_evaluate(state: dict) -> str:
-    """评估节点的路由决策"""
+    """评估节点的路由决策 (v2: 考虑新状态 + Graveyard 复活)"""
     tree: SearchTree = state.get("search_tree")
     cycle = state.get("current_cycle", 0)
     max_cycles = state.get("max_cycles", 15)
     dry_cycles = state.get("dry_cycles", 0)
     bb = state.get("blackboard")
+    expansion_stats = state.get("expansion_stats", {})
 
-    # 条件 1：达到最大周期
     if cycle >= max_cycles:
         logger.info("达到最大搜索周期 (%d)，进入报告", max_cycles)
         return "reporter"
 
-    # 条件 2：搜索树完全穷尽
     if tree and tree.all_explored():
+        if tree.graveyard and expansion_stats.get("resurrected", 0) > 0:
+            logger.info("Graveyard 中有节点被复活，继续搜索")
+            return "continue"
         logger.info("搜索树已全部探索，进入报告")
         return "reporter"
 
-    # 条件 3：连续 3 轮无发现且无高价值节点
     if dry_cycles >= 3:
         max_val = tree.max_unexplored_value() if tree else 0
-        if max_val < 0.4:
+        if max_val < 0.3:
             logger.info("连续 %d 轮无发现且最高价值 %.2f，进入报告", dry_cycles, max_val)
             return "reporter"
 
-    # 条件 4：已有足够发现（至少 8 个高危以上）
     if bb:
         high_findings = [f for f in bb.findings if f.severity in ("critical", "high")]
         if len(high_findings) >= 8:
@@ -565,52 +1018,41 @@ async def lats_pre_reporter_node(state: dict) -> dict:
     }
 
 
-# ──── Graph Builder ────
+# ──── Graph Builder (v2) ────
 
 def build_lats_graph():
-    """
-    构建 LATS + ReAct 混合架构的 LangGraph 图
-
-    Recon → Init Tree → [MCTS Select → React Execute → Evaluate] (循环) → Reporter
-    """
+    """构建 LATS + ReAct + 动态扩展 + 知识库的 LangGraph 图"""
     from app.agents.nodes.reporter import reporter_node
 
     graph = StateGraph(LATSState)
 
-    # 添加节点
     graph.add_node("recon", lats_recon_node)
     graph.add_node("init_tree", lats_init_tree_node)
     graph.add_node("mcts_select", lats_mcts_select_node)
     graph.add_node("react_execute", lats_react_execute_node)
+    graph.add_node("expand", lats_expand_node)  # v2
     graph.add_node("evaluate", lats_evaluate_node)
     graph.add_node("pre_reporter", lats_pre_reporter_node)
     graph.add_node("reporter", reporter_node)
 
-    # 设置入口
     graph.set_entry_point("recon")
 
-    # 固定边
     graph.add_edge("recon", "init_tree")
     graph.add_edge("init_tree", "mcts_select")
     graph.add_edge("mcts_select", "react_execute")
-    graph.add_edge("react_execute", "evaluate")
+    graph.add_edge("react_execute", "expand")  # v2: execute → expand
+    graph.add_edge("expand", "evaluate")        # v2: expand → evaluate
 
-    # 条件路由：继续搜索或报告
     graph.add_conditional_edges(
-        "evaluate",
-        route_from_evaluate,
-        {
-            "continue": "mcts_select",
-            "reporter": "pre_reporter",
-        },
+        "evaluate", route_from_evaluate,
+        {"continue": "mcts_select", "reporter": "pre_reporter"},
     )
 
-    # pre_reporter → reporter → END
     graph.add_edge("pre_reporter", "reporter")
     graph.add_edge("reporter", END)
 
     compiled = graph.compile()
-    logger.info("LATS 漏洞挖掘图构建完成")
+    logger.info("LATS v2 漏洞挖掘图构建完成 (自适应选择 + 动态扩展 + 共享知识库)")
     return compiled
 
 
@@ -619,8 +1061,17 @@ def create_lats_initial_state(
     task_config: dict,
     max_cycles: int = 15,
 ) -> dict:
-    """创建 LATS 任务的初始状态"""
+    """创建 LATS 任务的初始状态 (v2-fix: max_cycles 从 task_config 兜底)"""
     bb = Blackboard(task_id=task_id)
+    # v4-fix: 无条件从 task_config 读取更大的 max_cycles
+    config_max = int(task_config.get("max_iterations",
+                    task_config.get("config", {}).get("max_iterations", 0)))
+    if config_max > max_cycles:
+        max_cycles = config_max
+    # 如果 task_config 中有 max_cycles 字段也读取
+    tc_max = int(task_config.get("max_cycles", 0))
+    if tc_max > max_cycles:
+        max_cycles = tc_max
 
     return {
         "blackboard": bb,
@@ -634,4 +1085,7 @@ def create_lats_initial_state(
         "dry_cycles": 0,
         "selected_nodes": [],
         "react_results": [],
+        "expansion_candidates": [],
+        "discoveries": [],
+        "expansion_stats": {},
     }

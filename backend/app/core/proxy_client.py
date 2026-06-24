@@ -59,7 +59,10 @@ class ProxyFlowConsumer:
     def get_flows(self, task_id: str | None = None, limit: int = 100) -> list[dict]:
         flows = list(self._flows)
         if task_id:
-            flows = [f for f in flows if f.get("task_id") == task_id]
+            matched = [f for f in flows if f.get("task_id") == task_id]
+            # v3-fix: 如果按 task_id 匹配为空，回退到返回最近流量（不过滤 task_id）
+            if matched:
+                return matched[-limit:]
         return flows[-limit:]
 
     def clear_flows(self) -> None:

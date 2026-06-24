@@ -15,6 +15,17 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 logger = structlog.get_logger()
 
 
+def _sanitize_for_db(obj):
+    """递归清洗对象中的非 UTF-8 字符串，防止 PostgreSQL UntranslatableCharacterError"""
+    if isinstance(obj, str):
+        return obj.encode('utf-8', errors='replace').decode('utf-8')
+    elif isinstance(obj, dict):
+        return {str(k): _sanitize_for_db(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_sanitize_for_db(i) for i in obj]
+    return obj
+
+
 class AgentRunner:
     """
     Agent 运行器：在后台 asyncio Task 中执行 LangGraph 图。
@@ -39,6 +50,8 @@ class AgentRunner:
         # task_id -> asyncio.Event，用于暂停/恢复控制
         self._pause_events: dict[str, asyncio.Event] = {}
         self._session_factory = session_factory
+        # v2: 跟踪活跃任务的 LATSState (供 WebSocket 用户干预)
+        self._active_states: dict[str, dict] = {}
 
     async def start_task(
         self,
@@ -59,6 +72,15 @@ class AgentRunner:
             max_iterations: 最大迭代次数
             mode: 执行模式 - "lats" (LATS+ReAct 搜索架构) 或 "pipeline" (旧版固定管线)
         """
+        # v6: 从 task_config 深层兜底读取 max_iterations
+        if max_iterations <= 8:
+            nested = task_config.get("config", {}).get("max_iterations", 0)
+            if nested > max_iterations:
+                max_iterations = nested
+            flat = int(task_config.get("max_iterations", 0))
+            if flat > max_iterations:
+                max_iterations = flat
+
         if task_id in self._tasks:
             logger.warning("task_already_running", task_id=task_id)
             return
@@ -150,7 +172,11 @@ class AgentRunner:
             if mode == "lats":
                 from app.agents.lats.graph import build_lats_graph, create_lats_initial_state
                 graph = build_lats_graph()
-                initial_state = create_lats_initial_state(task_id, task_config, max_cycles=max_iterations)
+                # v4-fix: 确保 max_iterations 正确传递, 默认不低于 10
+                effective_max = max(max_iterations, 10) if max_iterations else 15
+                logger.info("lats_graph_start", task_id=task_id, max_iterations=max_iterations,
+                            effective_max=effective_max, task_config_keys=list(task_config.keys())[:10])
+                initial_state = create_lats_initial_state(task_id, task_config, max_cycles=effective_max)
             else:
                 from app.agents.graph import build_vuln_hunt_graph, create_initial_state
                 graph = build_vuln_hunt_graph()
@@ -168,6 +194,8 @@ class AgentRunner:
                 await db.commit()
 
             # 执行 LangGraph 图
+            # v2: 将初始状态注册到活跃状态表 (供 WebSocket 用户干预)
+            self._active_states[task_id] = initial_state
             result = await graph.ainvoke(initial_state)
 
             # 处理执行结果：持久化漏洞发现和报告
@@ -179,17 +207,22 @@ class AgentRunner:
                     for f in bb.findings:
                         try:
                             h_id = getattr(f, "hypothesis_id", None)
+                            # v4-fix: 清洗二进制数据防止 DB 编码错误
+                            safe_description = _sanitize_for_db(str(getattr(f, "description", "")))[:5000]
+                            safe_payload = _sanitize_for_db(str(getattr(f, "payload", "")))[:2000]
+                            safe_steps = _sanitize_for_db(getattr(f, "reproduction_steps", []))
+                            safe_evidence = _sanitize_for_db(getattr(f, "evidence", {}))
                             await finding_svc.create_finding(
                                 task_id=uuid_mod.UUID(task_id) if isinstance(task_id, str) else task_id,
                                 hypothesis_id=uuid_mod.UUID(h_id) if h_id else None,
                                 type=getattr(f, "type", "unknown"),
                                 severity=getattr(f, "severity", "info"),
-                                title=getattr(f, "title", "未命名发现"),
-                                description=getattr(f, "description", ""),
-                                trigger_path=getattr(f, "trigger_path", []),
-                                payload=getattr(f, "payload", ""),
-                                reproduction_steps=getattr(f, "reproduction_steps", []),
-                                evidence=getattr(f, "evidence", {}),
+                                title=_sanitize_for_db(str(getattr(f, "title", "未命名发现")))[:500],
+                                description=safe_description,
+                                trigger_path=_sanitize_for_db(getattr(f, "trigger_path", [])),
+                                payload=safe_payload,
+                                reproduction_steps=safe_steps,
+                                evidence=safe_evidence,
                             )
                         except Exception as e:
                             logger.error("finding_persist_failed", task_id=task_id, error=str(e))
@@ -201,10 +234,10 @@ class AgentRunner:
                     for report in bb.reports:
                         await report_svc.create_report(
                             task_id=task_id,
-                            content=report.get("content", ""),
+                            content=_sanitize_for_db(str(report.get("content", "")))[:100000],
                             format=report.get("format", "markdown"),
                             findings_count=report.get("findings_count", 0),
-                            severity_distribution=report.get("severity_distribution", {}),
+                            severity_distribution=_sanitize_for_db(report.get("severity_distribution", {})),
                         )
 
                 # 更新任务状态为完成，并记录发现数量
@@ -277,10 +310,11 @@ class AgentRunner:
         """
         清理任务资源
 
-        从内存映射中移除任务和暂停事件的引用。
+        从内存映射中移除任务、暂停事件和活跃状态的引用。
         """
         self._tasks.pop(task_id, None)
         self._pause_events.pop(task_id, None)
+        self._active_states.pop(task_id, None)  # v2
 
 
 # 全局单例占位（在 main.py lifespan 中用实际的 session_factory 初始化）

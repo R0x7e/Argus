@@ -250,6 +250,48 @@ async def _run_reconnaissance(state: VulnHuntState) -> dict:
 
         recon_results["tools_run"].append("recursive_crawl")
 
+    # === 第2.5层: Playwright 渲染参数提取 (v9: 遍历子页面) ===
+    playwright_params = []
+    playwright_forms = []
+    try:
+        from app.core.playwright_manager import get_browser
+        browser = get_browser()
+        pages_to_probe = [target_url] + [p.get("url", "") for p in recon_results.get("crawled_pages", [])[:5] if p.get("url")]
+        for probe_url in pages_to_probe[:4]:
+            try:
+                bctx = await browser.new_context(ignore_https_errors=True)
+                page = await bctx.new_page()
+                await page.goto(probe_url, wait_until="domcontentloaded", timeout=10000)
+                pw_inputs = await page.evaluate("""() => {
+                    return [...document.querySelectorAll('input,textarea,select,button')]
+                        .map(el => ({name: el.name || el.id, type: el.type || el.tagName.toLowerCase()}))
+                        .filter(x => x.name);
+                }""")
+                for inp in (pw_inputs or [])[:20]:
+                    playwright_params.append({"name": inp["name"], "type": inp["type"], "source": "playwright"})
+                pw_forms = await page.evaluate("""() => {
+                    return [...document.querySelectorAll('form')].map(f => ({
+                        action: f.action, method: (f.method || 'GET').toUpperCase(),
+                        inputs: [...f.querySelectorAll('input,textarea,select')].map(i => i.name || i.id).filter(Boolean)
+                    }));
+                }""")
+                for fm in (pw_forms or [])[:5]:
+                    playwright_forms.append(fm)
+                    for pname in fm.get("inputs", []):
+                        if not any(p.get("name") == pname for p in playwright_params):
+                            playwright_params.append({"name": pname, "type": "form_input", "source": "playwright_form"})
+                await bctx.close()
+            except Exception:
+                pass
+        logger.info("Playwright params: %d from %d pages", len(playwright_params), len(pages_to_probe))
+        if playwright_params:
+            recon_results["parameters"].extend(playwright_params)
+            recon_results["tools_run"].append("playwright_params")
+        if playwright_forms:
+            recon_results["forms"].extend(playwright_forms)
+    except Exception as e:
+        logger.warning("Playwright param extraction failed: %s", str(e))
+
     # 去重参数
     seen_params = set()
     unique_params = []

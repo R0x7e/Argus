@@ -24,6 +24,7 @@ class ActionType(str, Enum):
 
     # 注入测试类
     INJECT_PAYLOAD = "inject_payload"
+    BATCH_INJECT = "batch_inject"       # v7: 批量注入
     MUTATE_PAYLOAD = "mutate_payload"
     PROBE_FILTER = "probe_filter"
 
@@ -122,7 +123,9 @@ async def execute_action(
 
     try:
         if action == ActionType.INJECT_PAYLOAD:
-            return await _execute_inject(params, context, tool_registry)
+            return await _execute_inject(params, context, tool_registry, state)
+        elif action == ActionType.BATCH_INJECT:
+            return await _execute_batch_inject(params, context, tool_registry, state)
         elif action == ActionType.MUTATE_PAYLOAD:
             return await _execute_mutate(params, context, tool_registry)
         elif action == ActionType.PROBE_FILTER:
@@ -160,17 +163,25 @@ async def execute_action(
         return Observation(success=False, summary=f"执行异常: {str(e)}")
 
 
-async def _execute_inject(params: dict, context: ExecutionContext, registry) -> Observation:
-    """注入 payload 并分析响应"""
+async def _execute_inject(params: dict, context: ExecutionContext, registry, state: Any = None) -> Observation:
+    """注入 payload 并分析响应 (v5: state 参数用于 _detect_vuln_indicators)"""
     url = params.get("url", "")
     param = params.get("param", "")
     payload = params.get("payload", "")
     method = params.get("method", "GET")
 
-    if not url or not param or not payload:
-        return Observation(success=False, summary="inject_payload 缺少必要参数 (url/param/payload)")
-
-    req_params = _build_inject_url(url, param, payload, method)
+    # v3-fix: 无参端点回退 — 直接在 URL 路径追加 payload 或使用 dummy 参数
+    if not param and not payload:
+        # 无参端点: 直接 GET 请求获取响应体
+        req_params = {"url": url, "method": method or "GET", "follow_redirects": False}
+    elif not payload:
+        req_params = {"url": url, "method": method or "GET", "follow_redirects": False}
+    elif not param:
+        # 有 payload 但无参数名: 将 payload 作为 URL 路径后缀
+        sep = "/" if url.endswith("/") else "/"
+        req_params = {"url": f"{url}{sep}{payload}", "method": method or "GET", "follow_redirects": False}
+    else:
+        req_params = _build_inject_url(url, param, payload, method)
     tool = registry.get("http_request")
     result = await tool.execute(req_params, context)
 
@@ -218,7 +229,14 @@ async def _execute_inject(params: dict, context: ExecutionContext, registry) -> 
         obs.new_facts.append(f"Payload 在响应中原样反射 (param={param})")
 
     # 检测关键指标
-    _detect_vuln_indicators(obs, payload, body, status, headers, time_ms)
+    _detect_vuln_indicators(obs, payload, body, status, headers, time_ms, state)
+
+    # v7: DOM 结构变化检测 — 即使 body_len 相同, 标签数量可能不同
+    for tag in ("<form", "<input", "<div", "<table", "<a ", "<p ", "<script", "<h1", "<h2"):
+        if body[:3000].lower().count(tag) != (baseline.get("body", "") or "")[:3000].lower().count(tag):
+            obs.new_info_gained = True
+            obs.new_facts.append(f"DOM 结构变化: {tag} 数量不同")
+            break
 
     obs.summary = (
         f"status={status}, time={time_ms}ms, "
@@ -232,9 +250,10 @@ async def _execute_inject(params: dict, context: ExecutionContext, registry) -> 
     return obs
 
 
-def _detect_vuln_indicators(obs: Observation, payload: str, body: str, status: int, headers: dict, time_ms: int):
-    """检测各类漏洞确认指标"""
+def _detect_vuln_indicators(obs: Observation, payload: str, body: str, status: int, headers: dict, time_ms: int, state: Any = None):
+    """检测各类漏洞确认指标 (v5: 发现明确信号时自动升级节点 vuln_type)"""
     body_lower = body.lower()
+    detected_type = None
 
     # LFI/Path Traversal
     lfi_indicators = ["root:", "/bin/bash", "/bin/sh", "daemon:", "nobody:", "[boot loader]", "[extensions]"]
@@ -243,6 +262,7 @@ def _detect_vuln_indicators(obs: Observation, payload: str, body: str, status: i
         obs.severity = "high"
         obs.finding = {"type": "lfi", "evidence": "文件内容泄露", "payload": payload}
         obs.new_facts.append("LFI 确认: 系统文件内容出现在响应中")
+        detected_type = "lfi"
 
     # XSS (reflected)
     xss_indicators = ["<script>alert(", "onerror=alert(", "<svg/onload=", "ontoggle=alert(", "<img src=x onerror="]
@@ -251,6 +271,7 @@ def _detect_vuln_indicators(obs: Observation, payload: str, body: str, status: i
         obs.severity = "medium"
         obs.finding = {"type": "xss", "evidence": "XSS payload 反射", "payload": payload}
         obs.new_facts.append("XSS 确认: payload 在响应中原样执行")
+        detected_type = "xss"
 
     # SSTI
     if "49" in body and "{{7*7}}" not in body and "${7*7}" not in body and ("7*7" in payload or "config" in payload):
@@ -258,10 +279,12 @@ def _detect_vuln_indicators(obs: Observation, payload: str, body: str, status: i
         obs.severity = "high"
         obs.finding = {"type": "ssti", "evidence": "模板表达式被执行", "payload": payload}
         obs.new_facts.append("SSTI 确认: 表达式计算结果出现在响应中")
+        detected_type = "ssti"
     if "SECRET_KEY" in body or ("DEBUG" in body and "True" in body):
         obs.vuln_confirmed = True
         obs.severity = "high"
         obs.finding = {"type": "ssti", "evidence": "配置信息泄露", "payload": payload}
+        detected_type = "ssti"
 
     # RCE
     rce_indicators = ["uid=", "gid=", "www-data", "root:x:0"]
@@ -270,6 +293,7 @@ def _detect_vuln_indicators(obs: Observation, payload: str, body: str, status: i
         obs.severity = "critical"
         obs.finding = {"type": "rce", "evidence": "命令执行输出", "payload": payload}
         obs.new_facts.append("RCE 确认: 命令执行结果出现在响应中")
+        detected_type = "rce"
 
     # SQL Injection (error-based)
     sqli_errors = ["sql syntax", "mysql_fetch", "unclosed quotation", "you have an error in your sql",
@@ -279,6 +303,7 @@ def _detect_vuln_indicators(obs: Observation, payload: str, body: str, status: i
         obs.severity = "high"
         obs.finding = {"type": "sql_injection", "evidence": "SQL 错误信息", "payload": payload}
         obs.new_facts.append("SQLi 确认 (error-based): SQL 错误消息出现在响应中")
+        detected_type = "sql_injection"
 
     # SQL Injection (time-based)
     if time_ms > 3000 and ("sleep" in payload.lower() or "pg_sleep" in payload.lower() or "waitfor" in payload.lower()):
@@ -286,6 +311,7 @@ def _detect_vuln_indicators(obs: Observation, payload: str, body: str, status: i
         obs.severity = "high"
         obs.finding = {"type": "sql_injection", "evidence": f"时间延迟 {time_ms}ms", "payload": payload}
         obs.new_facts.append(f"SQLi 确认 (time-based): 响应延迟 {time_ms}ms")
+        detected_type = "sql_injection"
 
     # Open Redirect
     location = headers.get("location", "") or headers.get("Location", "")
@@ -293,6 +319,7 @@ def _detect_vuln_indicators(obs: Observation, payload: str, body: str, status: i
         obs.vuln_confirmed = True
         obs.severity = "medium"
         obs.finding = {"type": "open_redirect", "evidence": f"重定向到 {location}", "payload": payload}
+        detected_type = "open_redirect"
 
     # Info Disclosure
     sensitive_patterns = ["password", "secret", "api_key", "private_key", "AWS_SECRET",
@@ -302,6 +329,78 @@ def _detect_vuln_indicators(obs: Observation, payload: str, body: str, status: i
         obs.severity = "medium"
         obs.finding = {"type": "info_disclosure", "evidence": "敏感信息泄露", "payload": payload}
         obs.new_facts.append("信息泄露确认: 敏感数据出现在响应中")
+        detected_type = "info_disclosure"
+
+    # v5: 自动升级节点 vuln_type — Agent 发现了与节点类型不同的漏洞信号
+    if detected_type and state is not None and hasattr(state, 'vuln_type'):
+        if state.vuln_type != detected_type and state.vuln_type in ("auth_bypass", "info_disclosure", ""):
+            state.vuln_type = detected_type
+            obs.new_facts.append(f"节点类型自动升级: {state.vuln_type} → {detected_type}")
+
+
+async def _execute_batch_inject(params: dict, context: ExecutionContext, registry, state: Any = None) -> Observation:
+    """v8: 批量注入 — 支持 preset 参数调用 payload 库"""
+    url = params.get("url", "")
+    param = params.get("param", "")
+    payloads = params.get("payloads", [])
+    preset = params.get("preset", "")
+    method = params.get("method", "GET")
+
+    # v8: preset 支持 — 从 payload 库加载
+    if preset and not payloads:
+        try:
+            from .payload_library import get_payloads, get_preset_for_vuln_type
+            vuln_type = get_preset_for_vuln_type(preset if preset != "auto" else "")
+            if not vuln_type:
+                vuln_type = preset
+            loaded = get_payloads(vuln_type, "quick_scan")
+            payloads = loaded if loaded else payloads
+        except Exception:
+            pass
+
+    if not url or not param or not payloads:
+        return Observation(success=False, summary="batch_inject 缺少 url/param/payloads")
+
+    tool = registry.get("http_request")
+    # Baseline
+    baseline = await tool.execute({"url": url, "method": method}, context)
+    bl_status = baseline.get("status_code", 0)
+    bl_len = len(baseline.get("body", "") or "")
+    bl_time = baseline.get("response_time_ms", 0)
+
+    results = []
+    anomalies = []
+    for payload in payloads[:8]:
+        req_params = _build_inject_url(url, param, str(payload), method)
+        r = await tool.execute(req_params, context)
+        r_status = r.get("status_code", 0)
+        r_body = r.get("body", "") or ""
+        r_len = len(r_body)
+        r_time = r.get("response_time_ms", 0)
+        entry = {"payload": str(payload)[:80], "status": r_status, "len": r_len, "time_ms": r_time}
+        results.append(entry)
+        # 异常检测
+        if r_status != bl_status and r_status not in (404, 403):
+            anomalies.append(f"status {bl_status}→{r_status}: {payload[:40]}")
+        elif abs(r_len - bl_len) > 100:
+            anomalies.append(f"len diff {r_len - bl_len}: {payload[:40]}")
+        elif r_time - bl_time > 2000:
+            anomalies.append(f"time +{r_time - bl_time}ms: {payload[:40]}")
+
+    summary = f"batch_inject: {len(results)} payloads"
+    if anomalies:
+        summary += f", ANOMALIES: {'; '.join(anomalies[:3])}"
+    else:
+        summary += ", all baseline (no diff)"
+
+    return Observation(
+        success=True,
+        summary=summary,
+        new_info_gained=bool(anomalies),
+        new_facts=[f"批量注入 {len(results)} payloads: {anomalies if anomalies else '全部与基线相同'}"] if anomalies else [],
+        tool_call={"tool": "http_request", "params": {"batch_inject": True},
+                   "result": {"results": results, "baseline_status": bl_status, "baseline_len": bl_len}},
+    )
 
 
 def _is_waf_response(body: str) -> bool:
@@ -413,14 +512,26 @@ async def _execute_crawl(params: dict, context: ExecutionContext, registry) -> O
         if not link.startswith(("javascript:", "mailto:", "data:")):
             links.add(link)
 
-    # 提取表单参数
-    form_params = re.findall(r'<(?:input|textarea|select)[^>]*name=["\']([^"\']+)["\']', body, re.IGNORECASE)
+    # v3: 多正则回退提取表单参数
+    form_params = set()
+    form_params.update(re.findall(r'<(?:input|textarea|select|button)[^>]*name="([^"]+)"', body, re.IGNORECASE))
+    form_params.update(re.findall(r"<(?:input|textarea|select|button)[^>]*name='([^']+)'", body, re.IGNORECASE))
+    form_params.update(re.findall(r'<(?:input|textarea|select|button)[^>]*name=(\w+)', body, re.IGNORECASE))
+    form_params.update(re.findall(r'<(?:input|textarea|select|button)[^>]*id="([^"]+)"', body, re.IGNORECASE))
+    form_params.update(re.findall(r'<(?:input|textarea)[^>]*placeholder="([^"]+)"', body, re.IGNORECASE))
+    form_param_list = list(form_params)
+
+    # 提取 form action
+    form_actions = re.findall(r'<form[^>]*action=["\']([^"\']+)["\']', body, re.IGNORECASE)
 
     new_facts = []
     if links:
-        new_facts.append(f"发现 {len(links)} 个链接")
-    if form_params:
-        new_facts.append(f"发现表单参数: {form_params[:10]}")
+        link_samples = sorted(links)[:10]
+        new_facts.append(f"发现 {len(links)} 个链接: {link_samples}")
+    if form_param_list:
+        new_facts.append(f"发现表单参数 ({len(form_param_list)}个): {form_param_list[:15]}")
+    if form_actions:
+        new_facts.append(f"发现表单提交目标: {form_actions[:5]}")
 
     return Observation(
         success=True,
@@ -434,7 +545,7 @@ async def _execute_crawl(params: dict, context: ExecutionContext, registry) -> O
 
 
 async def _execute_discover_params(params: dict, context: ExecutionContext, registry) -> Observation:
-    """参数发现 — 通过常见参数名字典探测"""
+    """参数发现 (v3: GET长度 + 状态码 + POST探测三重检测)"""
     url = params.get("url", "")
     if not url:
         return Observation(success=False, summary="discover_params 缺少 url")
@@ -444,35 +555,94 @@ async def _execute_discover_params(params: dict, context: ExecutionContext, regi
         "email", "file", "path", "url", "redirect", "next", "callback",
         "action", "cmd", "type", "category", "sort", "order", "limit",
         "offset", "token", "key", "api_key", "debug", "test", "admin",
+        "userId", "user_id", "password", "phone", "status", "role", "groupId",
+        "per_page", "pageSize", "keyword", "access_token", "auth",
+        "filename", "download", "upload", "dir", "folder",
+        "lang", "format", "return", "return_url", "source", "target",
+        "date", "startDate", "endDate",
     ]
 
     tool = registry.get("http_request")
 
-    # Baseline
+    # Baseline: GET
     baseline = await tool.execute({"url": url, "method": "GET"}, context)
     baseline_len = len(baseline.get("body", ""))
     baseline_status = baseline.get("status_code", 0)
 
+    # Baseline: POST (empty body)
+    post_baseline = await tool.execute(
+        {"url": url, "method": "POST", "body": "",
+         "headers": {"Content-Type": "application/x-www-form-urlencoded"}}, context)
+    post_baseline_len = len(post_baseline.get("body", ""))
+    post_baseline_status = post_baseline.get("status_code", 0)
+
     discovered = []
     sep = "&" if "?" in url else "?"
 
-    for p in common_params[:20]:
+    for p in common_params[:30]:
+        # ── 检测 1: GET 参数 + 长度差异 + 状态码 ──
         test_url = f"{url}{sep}{p}=test123"
         result = await tool.execute({"url": test_url, "method": "GET"}, context)
         test_len = len(result.get("body", ""))
         test_status = result.get("status_code", 0)
+        get_len_diff = abs(test_len - baseline_len)
+        get_status_changed = test_status != baseline_status and test_status not in (404, 403)
 
-        if test_status == baseline_status and abs(test_len - baseline_len) > 50:
-            discovered.append(p)
-        elif test_status != baseline_status and test_status not in (404, 403):
-            discovered.append(p)
+        # ── 检测 2: POST 参数探测 ──
+        post_result = await tool.execute(
+            {"url": url, "method": "POST", "body": f"{p}=test123",
+             "headers": {"Content-Type": "application/x-www-form-urlencoded"}}, context)
+        post_len = len(post_result.get("body", ""))
+        post_status = post_result.get("status_code", 0)
+        post_len_diff = abs(post_len - post_baseline_len)
+        post_status_changed = post_status != post_baseline_status and post_status not in (404, 403)
+
+        # ── 判定 ──
+        if get_len_diff > 80:
+            discovered.append({"name": p, "method": "GET", "evidence": f"len_diff={get_len_diff}"})
+        elif get_status_changed:
+            discovered.append({"name": p, "method": "GET", "evidence": f"status={baseline_status}->{test_status}"})
+        elif post_len_diff > 80:
+            discovered.append({"name": p, "method": "POST", "evidence": f"len_diff={post_len_diff}"})
+        elif post_status_changed:
+            discovered.append({"name": p, "method": "POST", "evidence": f"status={post_baseline_status}->{post_status}"})
+        # v4-fix: 内容指纹 — 对固定长度页面检测局部内容变化
+        elif get_len_diff > 0 and get_len_diff <= 80:
+            import re as _re2
+            bl_fp = _re2.sub(r'\d+', '', baseline.get("body", "")[:500])
+            pr_fp = _re2.sub(r'\d+', '', result.get("body", "")[:500])
+            if bl_fp != pr_fp:
+                discovered.append({"name": p, "method": "GET", "evidence": "content_fingerprint_diff"})
+
+    # 去重
+    seen = set()
+    unique = []
+    for d in discovered:
+        if d["name"] not in seen:
+            seen.add(d["name"])
+            unique.append(d)
+
+    # v7: 如果未发现, 从 URL 推断参数建议
+    inferred_hints = []
+    if not unique:
+        try:
+            from app.agents.lats.graph import _infer_params_from_url
+            inferred = _infer_params_from_url(url)
+            inferred_hints = [p["name"] for p in inferred[:5]]
+        except Exception:
+            pass
 
     return Observation(
         success=True,
-        summary=f"参数发现: {discovered}" if discovered else "未发现有效参数",
-        new_info_gained=bool(discovered),
-        new_facts=[f"发现有效参数: {discovered}"] if discovered else [],
-        tool_call={"tool": "http_request", "params": {"discover": True}, "result": {"found_params": discovered}},
+        summary=(f"参数发现: {[d['name'] for d in unique[:10]]}" if unique else
+                 f"未发现有效参数, URL推断: {inferred_hints}" if inferred_hints else
+                 "未发现有效参数"),
+        new_info_gained=bool(unique) or bool(inferred_hints),
+        new_facts=([f"发现有效参数: {[d['name'] for d in unique[:10]]}"] if unique else
+                   [f"URL推断参数(建议直接用 inject_payload 测试): {inferred_hints}"] if inferred_hints else
+                   []),
+        tool_call={"tool": "http_request", "params": {"discover": True},
+                   "result": {"found_params": unique, "inferred_params": inferred_hints}},
     )
 
 
@@ -541,12 +711,39 @@ async def _execute_no_auth(params: dict, context: ExecutionContext, registry) ->
         tool_call={"tool": "http_request", "params": {"url": url, "no_auth": True}, "result": {"status": status}},
     )
 
+    # v3: 端点敏感度分类 — 区分真正的认证绕过 vs 公开文件
+    import re as _re
+    _SENSITIVE = [
+        r'\.git', r'\.env', r'\.htaccess', r'\.svn', r'\.hg',
+        r'/admin', r'/dashboard', r'/config', r'/backup', r'/backups',
+        r'/api/', r'/graphql', r'/actuator', r'/jmx',
+        r'wp-admin', r'wp-config', r'phpmyadmin', r'phpinfo',
+        r'/manage', r'/console', r'/debug', r'/server-status',
+        r'\.sql$', r'\.bak$', r'\.old$', r'\.save$', r'\.orig$', r'\.swp$',
+        r'/user', r'/account', r'/order', r'/internal',
+    ]
+    _NON_SENSITIVE = [
+        r'README', r'LICENSE', r'CHANGELOG', r'\.md$', r'\.txt$',
+        r'robots\.txt', r'sitemap', r'favicon', r'\.xml$',
+        r'\.css$', r'\.js$', r'\.png$', r'\.jpg$', r'\.jpeg$',
+        r'\.gif$', r'\.svg$', r'\.ico$', r'\.woff', r'\.ttf$',
+    ]
+    is_sensitive = any(_re.search(p, url, _re.IGNORECASE) for p in _SENSITIVE)
+    is_non_sensitive = any(_re.search(p, url, _re.IGNORECASE) for p in _NON_SENSITIVE)
+
     if status == 200 and len(body) > 100:
-        obs.vuln_confirmed = True
-        obs.severity = "high"
-        obs.finding = {"type": "auth_bypass", "evidence": f"无认证访问返回 200 (body={len(body)} bytes)", "url": url}
-        obs.new_facts.append(f"未授权访问确认: {url} 无需认证即可访问")
-        obs.summary = f"AUTH_BYPASS: {url} 返回 200 无需认证"
+        if is_sensitive and not is_non_sensitive:
+            obs.vuln_confirmed = True
+            obs.severity = "high"
+            obs.finding = {"type": "auth_bypass", "evidence": f"敏感端点无认证访问: {url}", "url": url}
+            obs.new_facts.append(f"未授权访问确认 (敏感端点): {url}")
+            obs.summary = f"AUTH_BYPASS (敏感): {url} 返回 200 无需认证"
+        elif is_non_sensitive:
+            obs.summary = f"公开文件 (非漏洞): {url} 返回 200 (正常)"
+            obs.new_facts.append(f"公开文件可访问 (非漏洞): {url}")
+        else:
+            obs.summary = f"端点可访问 (待确认): {url} 返回 200"
+            obs.new_facts.append(f"端点可访问 (需进一步验证敏感度): {url}")
     elif status in (401, 403):
         obs.new_facts.append(f"{url} 需要认证 (status={status})")
         obs.summary = f"需要认证: status={status}"
@@ -672,13 +869,15 @@ async def _execute_extract_data(params: dict, context: ExecutionContext, registr
     body = result.get("body", "") or ""
     status = result.get("status_code", 0)
 
+    # v3-fix: 在 summary 中附 body 前 200 字符，让 LLM 直接看到内容
+    body_preview = body[:200].replace('\n', '\\n').replace('\r', '')
     return Observation(
         success=result.get("success", False),
         status_code=status,
         response_body=body[:2000],
-        summary=f"数据提取: status={status}, body_len={len(body)}",
+        summary=f"数据提取: status={status}, body_len={len(body)}, preview={body_preview}",
         new_info_gained=len(body) > 100,
-        new_facts=[f"提取数据 {len(body)} bytes"] if len(body) > 100 else [],
+        new_facts=[f"提取数据 {len(body)} bytes: {body_preview}"] if len(body) > 100 else [],
         tool_call={"tool": "http_request", "params": req_params, "result": {"status": status, "len": len(body)}},
     )
 
@@ -689,10 +888,19 @@ async def _execute_render_page(params: dict, context: ExecutionContext, registry
     if not url:
         return Observation(success=False, summary="render_page 缺少 url")
 
+    # v3-fix: wait_for 参数类型容错 — LLM 可能传整数(想设 timeout)
+    wait_for_raw = params.get("wait_for", "networkidle")
+    if isinstance(wait_for_raw, (int, float)):
+        wait_for = "networkidle"  # 整数转为默认值
+    elif isinstance(wait_for_raw, str) and wait_for_raw.strip():
+        wait_for = wait_for_raw.strip()
+    else:
+        wait_for = "networkidle"
+
     tool = registry.get("browser_request")
     result = await tool.execute({
         "url": url,
-        "wait_for": params.get("wait_for", "networkidle"),
+        "wait_for": wait_for,
         "extract_links": True,
         "extract_forms": True,
     }, context)
@@ -773,17 +981,33 @@ async def _execute_deep_crawl(params: dict, context: ExecutionContext, registry)
     urls = result.get("urls", [])
     forms = result.get("forms", [])
     parameters = result.get("parameters", [])
+    # v4-fix: 提取具体参数名和 URL 列表传给 LLM
+    param_names = []
+    for p in (parameters or [])[:20]:
+        if isinstance(p, dict):
+            param_names.append(p.get("name", ""))
+        elif isinstance(p, str):
+            param_names.append(p)
+    param_str = ", ".join([n for n in param_names if n]) or "无名称"
+
+    url_samples = []
+    for u in (urls or [])[:10]:
+        if isinstance(u, dict):
+            url_samples.append(u.get("url", "")[:80])
+        elif isinstance(u, str):
+            url_samples.append(u[:80])
+
     new_facts = []
     if urls:
-        new_facts.append(f"深度爬取发现 {len(urls)} 个 URL")
+        new_facts.append(f"深度爬取发现 {len(urls)} 个 URL: {url_samples}")
     if forms:
         new_facts.append(f"深度爬取发现 {len(forms)} 个表单")
     if parameters:
-        new_facts.append(f"深度爬取发现 {len(parameters)} 个参数")
+        new_facts.append(f"深度爬取发现参数 ({len(parameters)}个): {param_str}")
 
     return Observation(
         success=True,
-        summary=f"深度爬取: urls={len(urls)}, forms={len(forms)}, params={len(parameters)}",
+        summary=f"深度爬取: urls={len(urls)}, forms={len(forms)}, params={len(parameters)} ({param_str})",
         new_info_gained=bool(urls or forms or parameters),
         new_facts=new_facts,
         tool_call={"tool": "deep_crawl", "params": {"url": url}, "result": {"urls": urls[:20], "forms": forms[:5]}},
