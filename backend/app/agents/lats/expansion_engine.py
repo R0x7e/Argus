@@ -50,15 +50,15 @@ class Discovery:
 @dataclass
 class ExpansionQuotas:
     """每种发现类型的扩展配额 (防分支爆炸)"""
-    new_endpoint_per_cycle: int = 3       # 每周期最多基于新端点创建 3 个分支
-    new_endpoint_total: int = 20          # 累计不超过 20 个
+    new_endpoint_per_cycle: int = 10      # v11: 每周期最多基于新端点创建 10 个分支 (曾为 3)
+    new_endpoint_total: int = 80          # v11: 累计不超过 80 个 (曾为 20)
     new_param_per_endpoint: int = 5       # 每端点最多 5 个参数节点
-    waf_bypass_assoc_nodes: int = 5       # 每种 bypass 技术最多关联 5 个节点
-    tech_discovery_new_types: int = 3     # 每种技术栈最多触发 3 个新 vuln_type
-    auth_context_endpoints: int = 10      # 每个新认证上下文最多测试 10 个端点
-    vuln_type_clue_per_signal: int = 1    # 每个漏洞信号最多创建 1 个新子节点
-    llm_suggestion_per_cycle: int = 2     # 每周期最多采纳 2 个 LLM 建议
-    global_max_nodes: int = 200           # 全局节点上限
+    waf_bypass_assoc_nodes: int = 10      # v11: 从 5→10
+    tech_discovery_new_types: int = 5     # v11: 从 3→5
+    auth_context_endpoints: int = 20      # v11: 从 10→20
+    vuln_type_clue_per_signal: int = 3    # v11: 从 1→3
+    llm_suggestion_per_cycle: int = 3     # v11: 从 2→3
+    global_max_nodes: int = 300           # v11: 从 200→300
 
     # 运行计数器 (每周期重置)
     cycle_new_endpoints: int = 0
@@ -76,15 +76,24 @@ class ExpansionQuotas:
 
     def can_create(self, discovery_type: DiscoveryType, search_tree: SearchTree,
                    extra: dict | None = None) -> bool:
-        """检查是否还有该类发现的创建配额"""
+        """检查是否还有该类发现的创建配额 (v11: 分级冷却)"""
         # 全局上限
         if len(search_tree.nodes) >= self.global_max_nodes:
             return False
 
         extra = extra or {}
 
+        # v11: 分级冷却 — 按周期阶段调整单周期配额
+        cycle = extra.get("cycle", 0) if extra else 0
+        if cycle <= 5:
+            effective_per_cycle = self.new_endpoint_per_cycle      # 全配额
+        elif cycle <= 10:
+            effective_per_cycle = max(2, self.new_endpoint_per_cycle // 2)  # 半配额
+        else:
+            effective_per_cycle = 2                                    # 最低配额
+
         if discovery_type == DiscoveryType.NEW_ENDPOINT:
-            return (self.cycle_new_endpoints < self.new_endpoint_per_cycle and
+            return (self.cycle_new_endpoints < effective_per_cycle and
                     self.total_new_endpoints < self.new_endpoint_total)
 
         elif discovery_type == DiscoveryType.NEW_PARAM:
@@ -490,7 +499,7 @@ class ExpansionEngine:
             return {"new_branches": 0, "resurrected": 0, "discoveries_processed": 0, "by_type": {}}
 
         for discovery in discoveries:
-            if not self.quotas.can_create(discovery.discovery_type, tree):
+            if not self.quotas.can_create(discovery.discovery_type, tree, extra={"cycle": current_cycle}):
                 continue
 
             created_nodes = self._create_branches_for_discovery(

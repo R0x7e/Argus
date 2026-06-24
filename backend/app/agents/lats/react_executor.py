@@ -343,11 +343,13 @@ class ReactExecutorPool:
                 )
                 self.total_executed += 1
 
-                # 更新节点状态
+                # 更新节点状态 (v11: step_limit 不立即 exhaust)
                 if result.status == "finding":
                     node.status = NodeStatus.CONFIRMED_VULN
-                elif result.status in ("exhausted", "backtrack", "step_limit"):
+                elif result.status in ("exhausted", "backtrack"):
                     node.status = NodeStatus.EXHAUSTED
+                elif result.status == "step_limit":
+                    node.status = NodeStatus.NEEDS_EXPANSION  # 步数耗尽但可能还有价值
                 else:
                     node.status = NodeStatus.NEEDS_EXPANSION
 

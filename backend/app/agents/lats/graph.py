@@ -707,7 +707,12 @@ async def lats_react_execute_node(state: dict) -> dict:
             })
 
         elif result.status in ("exhausted", "backtrack"):
-            tree.mark_exhausted(result.node_id)
+            # v11: 高价值节点降级为 NEEDS_EXPANSION, 不急于 exhaust
+            node_for_check = tree.get_node(result.node_id)
+            if node_for_check and node_for_check.value_estimate > 0.55:
+                node_for_check.status = NodeStatus.NEEDS_EXPANSION
+            else:
+                tree.mark_exhausted(result.node_id)
 
         elif result.status == "step_limit":
             if result.reward > 0.2:
