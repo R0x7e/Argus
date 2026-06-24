@@ -1,6 +1,5 @@
 // ============================================================
-// WebSocket 管理器 — 用于实时事件流推送
-// 支持 JWT Token 认证和精确连接状态追踪
+// WebSocket 管理器 v2 — 双向通信 (事件接收 + 用户干预发送)
 // ============================================================
 
 import type { AgentEvent } from "@/types";
@@ -8,21 +7,13 @@ import { useAuthStore } from "@/stores/auth";
 
 type EventCallback = (event: AgentEvent) => void;
 type ConnectionCallback = (connected: boolean) => void;
+type MessageCallback = (msg: any) => void;
 
-/**
- * WebSocket 连接管理器
- *
- * 功能：
- * - 通过 query param 传递 JWT Token 认证
- * - 自动根据页面协议选择 ws / wss
- * - 指数退避重连（最多 5 次，上限 30 秒）
- * - 精确的连接状态回调
- * - 支持多个订阅回调
- */
 export class WebSocketManager {
   private ws: WebSocket | null = null;
   private callbacks: Set<EventCallback> = new Set();
   private connectionCallbacks: Set<ConnectionCallback> = new Set();
+  private messageCallbacks: Set<MessageCallback> = new Set();  // v2: 通用消息回调
   private taskId: string;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
@@ -37,13 +28,19 @@ export class WebSocketManager {
     return this._connected;
   }
 
+  /** 发送消息到后端 (v2: 用户干预) */
+  send(msg: object): boolean {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(msg));
+      return true;
+    }
+    return false;
+  }
+
   /** 建立 WebSocket 连接 */
   connect() {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const host =
-      process.env.NEXT_PUBLIC_WS_HOST || window.location.host;
-
-    // 携带 JWT Token 作为 query param（WebSocket 不支持自定义 header）
+    const host = process.env.NEXT_PUBLIC_WS_HOST || window.location.host;
     const token = useAuthStore.getState().token;
     const tokenParam = token ? `?token=${encodeURIComponent(token)}` : "";
 
@@ -63,6 +60,8 @@ export class WebSocketManager {
         if (msg.type === "event") {
           this.callbacks.forEach((cb) => cb(msg.data as AgentEvent));
         }
+        // v2: 转发所有消息给通用回调 (user_action_ack 等)
+        this.messageCallbacks.forEach((cb) => cb(msg));
       } catch {
         // 解析失败静默忽略
       }
@@ -82,36 +81,36 @@ export class WebSocketManager {
   /** 订阅事件 */
   subscribe(cb: EventCallback): () => void {
     this.callbacks.add(cb);
-    return () => {
-      this.callbacks.delete(cb);
-    };
+    return () => { this.callbacks.delete(cb); };
+  }
+
+  /** 订阅所有消息 (v2: 包括 user_action_ack) */
+  onMessage(cb: MessageCallback): () => void {
+    this.messageCallbacks.add(cb);
+    return () => { this.messageCallbacks.delete(cb); };
   }
 
   /** 订阅连接状态变化 */
   onConnectionChange(cb: ConnectionCallback): () => void {
     this.connectionCallbacks.add(cb);
-    return () => {
-      this.connectionCallbacks.delete(cb);
-    };
+    return () => { this.connectionCallbacks.delete(cb); };
   }
 
-  /** 断开连接并清理所有状态 */
+  /** 断开连接 */
   disconnect() {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     this.ws?.close();
     this.ws = null;
     this._connected = false;
     this.callbacks.clear();
     this.connectionCallbacks.clear();
+    this.messageCallbacks.clear();
   }
 
   /** 发送心跳 */
   ping() {
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ action: "ping" }));
+      this.ws.send(JSON.stringify({ type: "ping" }));
     }
   }
 
@@ -119,15 +118,10 @@ export class WebSocketManager {
     this.connectionCallbacks.forEach((cb) => cb(connected));
   }
 
-  /** 指数退避重连调度 */
+  /** 指数退避重连 */
   private scheduleReconnect() {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      return;
-    }
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) return;
     const delay = Math.min(1000 * 2 ** this.reconnectAttempts, 30000);
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectAttempts++;
-      this.connect();
-    }, delay);
+    this.reconnectTimer = setTimeout(() => { this.reconnectAttempts++; this.connect(); }, delay);
   }
 }
