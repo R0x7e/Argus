@@ -231,13 +231,6 @@ async def _execute_inject(params: dict, context: ExecutionContext, registry, sta
     # 检测关键指标
     _detect_vuln_indicators(obs, payload, body, status, headers, time_ms, state)
 
-    # v7: DOM 结构变化检测 — 即使 body_len 相同, 标签数量可能不同
-    for tag in ("<form", "<input", "<div", "<table", "<a ", "<p ", "<script", "<h1", "<h2"):
-        if body[:3000].lower().count(tag) != (baseline.get("body", "") or "")[:3000].lower().count(tag):
-            obs.new_info_gained = True
-            obs.new_facts.append(f"DOM 结构变化: {tag} 数量不同")
-            break
-
     obs.summary = (
         f"status={status}, time={time_ms}ms, "
         f"body_len={len(body)}, "
@@ -362,10 +355,12 @@ async def _execute_batch_inject(params: dict, context: ExecutionContext, registr
         return Observation(success=False, summary="batch_inject 缺少 url/param/payloads")
 
     tool = registry.get("http_request")
-    # Baseline
-    baseline = await tool.execute({"url": url, "method": method}, context)
+    # Baseline — 使用中性参数值, 而非裸 URL (裸 URL 可能返回不同页面)
+    baseline_url = _build_inject_url(url, param, "1", method)["url"]
+    baseline = await tool.execute({"url": baseline_url, "method": method}, context)
     bl_status = baseline.get("status_code", 0)
-    bl_len = len(baseline.get("body", "") or "")
+    baseline_body = baseline.get("body", "") or ""
+    bl_len = len(baseline_body)
     bl_time = baseline.get("response_time_ms", 0)
 
     results = []
@@ -377,15 +372,23 @@ async def _execute_batch_inject(params: dict, context: ExecutionContext, registr
         r_body = r.get("body", "") or ""
         r_len = len(r_body)
         r_time = r.get("response_time_ms", 0)
-        entry = {"payload": str(payload)[:80], "status": r_status, "len": r_len, "time_ms": r_time}
+        entry = {"payload": str(payload)[:80], "status": r_status, "len": r_len, "time_ms": r_time,
+                 "body_preview": r_body[:150].replace('\n','\\n').replace('\r','')}
         results.append(entry)
         # 异常检测
         if r_status != bl_status and r_status not in (404, 403):
             anomalies.append(f"status {bl_status}→{r_status}: {payload[:40]}")
-        elif abs(r_len - bl_len) > 100:
+        elif abs(r_len - bl_len) > 50:  # v10: 阈值 100→50, 更敏感
             anomalies.append(f"len diff {r_len - bl_len}: {payload[:40]}")
-        elif r_time - bl_time > 2000:
+        elif r_time - bl_time > 1500:  # v10: 阈值 2000→1500ms
             anomalies.append(f"time +{r_time - bl_time}ms: {payload[:40]}")
+        # v10: 内容指纹 — 去数字后对比
+        elif r_len == bl_len and r_body != baseline_body:
+            import re as _re4
+            bl_fp = _re4.sub(r'\d+', '', baseline_body[:500])
+            r_fp = _re4.sub(r'\d+', '', r_body[:500])
+            if bl_fp != r_fp:
+                anomalies.append(f"content fingerprint diff: {payload[:40]}")
 
     summary = f"batch_inject: {len(results)} payloads"
     if anomalies:

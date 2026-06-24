@@ -101,6 +101,7 @@ async def execute(req: ExecuteRequest):
     restricted_globals["__builtins__"]["__import__"] = _safe_import
     restricted_globals["_getiter_"] = default_guarded_getiter
     restricted_globals["_unpack_sequence_"] = guarded_unpack_sequence
+    restricted_globals["_iter_unpack_sequence_"] = guarded_unpack_sequence  # v10: 新版 RestrictedPython 需要
     restricted_globals["_getattr_"] = safer_getattr
     restricted_globals["_print_"] = PrintCollector
     restricted_globals["_getitem_"] = lambda obj, key: obj[key]
@@ -108,6 +109,9 @@ async def execute(req: ExecuteRequest):
     restricted_globals["_inplacevar_"] = lambda op, x, y: op(x, y)
     restricted_globals["TARGET_HOST"] = req.target_host
     restricted_globals["ALLOWED_HOSTS"] = req.allowed_hosts or [req.target_host]
+    # v10: 预导入常用模块到 restricted_globals
+    import json as _json
+    restricted_globals["json"] = _json
 
     stdout_capture = io.StringIO()
     stderr_capture = io.StringIO()
