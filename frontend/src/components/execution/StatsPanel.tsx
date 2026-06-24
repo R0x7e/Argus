@@ -59,7 +59,7 @@ export function StatsPanel({ events }: StatsPanelProps) {
   }, [events]);
 
   const treeStats = useMemo<TreeStats>(() => {
-    const cycleEvents = events.filter((e) => e.type === "cycle_complete" || e.event_type === "cycle_summary");
+    const cycleEvents = events.filter((e) => e.type === "cycle_summary" || e.type === "cycle_complete");
     const last = cycleEvents[cycleEvents.length - 1];
     const stats = last?.data?.tree_stats || {};
     return {
@@ -110,7 +110,7 @@ export function StatsPanel({ events }: StatsPanelProps) {
   }, [events]);
 
   const cycleInfo = useMemo(() => {
-    const cycleEvents = events.filter((e) => e.type === "cycle_complete" || e.event_type === "cycle_summary");
+    const cycleEvents = events.filter((e) => e.type === "cycle_summary" || e.type === "cycle_complete");
     const last = cycleEvents[cycleEvents.length - 1];
     return { cycle: last?.data?.cycle || 0, max_cycles: last?.data?.max_cycles || 15 };
   }, [events]);
