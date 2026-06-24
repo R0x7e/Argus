@@ -125,6 +125,9 @@ export const api = {
   terminateTask: (id: string) =>
     request<Task>(`/tasks/${id}/terminate`, { method: "POST" }),
 
+  deleteTask: (id: string) =>
+    request<{ message: string }>(`/tasks/${id}`, { method: "DELETE" }),
+
   // —— 事件流 ——
   getEvents: (taskId: string, params?: Record<string, string>) =>
     request<PaginatedResponse<AgentEvent>>(

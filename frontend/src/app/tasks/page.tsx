@@ -7,10 +7,11 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Loading } from "@/components/ui/loading";
 import { EmptyState } from "@/components/ui/empty-state";
-import { useTasks, useTaskAction } from "@/hooks/use-tasks";
+import { useTasks, useTaskAction, useDeleteTask } from "@/hooks/use-tasks";
 import { formatDate } from "@/lib/utils";
 import type { Task, TaskStatus } from "@/types";
-import { Plus, Play, Pause, Square, ListTodo } from "lucide-react";
+import { Plus, Play, Pause, Square, ListTodo, Trash2 } from "lucide-react";
+import { useState } from "react";
 
 /**
  * 根据任务状态返回可用操作按钮列表
@@ -39,9 +40,20 @@ function getTaskActions(task: Task) {
 export default function TasksPage() {
   const { data, isLoading } = useTasks();
   const taskAction = useTaskAction();
+  const deleteTask = useDeleteTask();
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
   const handleAction = (taskId: string, action: "start" | "pause" | "resume" | "terminate") => {
     taskAction.mutate({ taskId, action });
+  };
+
+  const handleDelete = (taskId: string) => {
+    if (confirmDelete === taskId) {
+      deleteTask.mutate(taskId);
+    } else {
+      setConfirmDelete(taskId);
+      setTimeout(() => setConfirmDelete(null), 5000);
+    }
   };
 
   return (
@@ -129,6 +141,17 @@ export default function TasksPage() {
                               {label}
                             </Button>
                           ))}
+                          {/* 删除按钮 */}
+                          <Button
+                            variant={confirmDelete === task.id ? "danger" : "ghost"}
+                            size="sm"
+                            onClick={() => handleDelete(task.id)}
+                            loading={deleteTask.isPending && deleteTask.variables === task.id}
+                            title={confirmDelete === task.id ? "确认删除" : "删除任务"}
+                          >
+                            <Trash2 className="h-3 w-3" />
+                            {confirmDelete === task.id ? "确认" : ""}
+                          </Button>
                           {/* 查看详情链接 */}
                           <Link href={`/tasks/${task.id}`}>
                             <Button variant="ghost" size="sm">

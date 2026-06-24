@@ -85,6 +85,17 @@ const actionMap: Record<TaskAction, (id: string) => Promise<Task>> = {
   terminate: api.terminateTask,
 };
 
+/** 删除任务 hook */
+export function useDeleteTask() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (taskId: string) => api.deleteTask(taskId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: taskKeys.lists() });
+    },
+  });
+}
+
 /**
  * 任务操作 mutation（启动 / 暂停 / 恢复 / 终止）
  * 操作完成后自动刷新对应任务及列表缓存
