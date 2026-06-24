@@ -302,6 +302,21 @@ async def lats_init_tree_node(state: dict) -> dict:
     attack_surface = bb.attack_surface or {}
     target_url = bb.target_profile.get("base_url", "")
     tech_stack = bb.target_profile.get("tech_stack", [])
+    # v14: 读取任务目标漏洞类型 — 从 config 或 task_name 推断
+    focus_vuln_types = task_config.get("focus_vuln_types", [])
+    if not focus_vuln_types:
+        task_name = task_config.get("name", task_config.get("task_name", ""))
+        name_lower = (task_name or "").lower()
+        name_hints = {"xss": ["xss"], "sqli": ["sql_injection"], "sql": ["sql_injection"],
+                      "rce": ["rce"], "cmd": ["rce"], "lfi": ["lfi", "path_traversal"],
+                      "ssrf": ["ssrf"], "ssti": ["ssti"], "idor": ["idor"],
+                      "upload": ["file_upload"], "redirect": ["open_redirect"]}
+        for hint, types in name_hints.items():
+            if hint in name_lower:
+                focus_vuln_types = types
+                break
+    if focus_vuln_types:
+        bb.focus_vuln_types = focus_vuln_types  # 存入 blackboard 供选择器使用
 
     await emit(task_id, "lats_init", "agent_started", {"node": "init_tree"})
 
@@ -320,6 +335,10 @@ async def lats_init_tree_node(state: dict) -> dict:
         status=NodeStatus.EXPLORING,  # v5: 根节点不应被选中执行
     )
     tree.set_root(root)
+
+    # v14: 设置搜索树的目标漏洞类型 (供选择器使用 focus bonus)
+    if focus_vuln_types:
+        tree.focus_vuln_types = focus_vuln_types
 
     # v5: URL 语义推断 + 随机抖动打破同质化
     import random as _random
@@ -346,7 +365,7 @@ async def lats_init_tree_node(state: dict) -> dict:
                 if branch_key in seen_branches:
                     continue
                 seen_branches.add(branch_key)
-                value = estimate_branch_value(vtype, "", path, tech_stack, source)
+                value = estimate_branch_value(vtype, "", path, tech_stack, source, focus_vuln_types=focus_vuln_types)
                 value += _random.uniform(-0.05, 0.05)  # v5: 打破同质化
                 value = max(0.05, min(1.0, value))
                 child = tree.create_child_node(
@@ -366,7 +385,7 @@ async def lats_init_tree_node(state: dict) -> dict:
                 if branch_key in seen_branches:
                     continue
                 seen_branches.add(branch_key)
-                value = estimate_branch_value(vtype, param_name, path, tech_stack, source)
+                value = estimate_branch_value(vtype, param_name, path, tech_stack, source, focus_vuln_types=focus_vuln_types)
                 value += _random.uniform(-0.05, 0.05)  # v5: 打破同质化
                 value = max(0.05, min(1.0, value))
                 child = tree.create_child_node(
@@ -390,7 +409,7 @@ async def lats_init_tree_node(state: dict) -> dict:
                 if branch_key in seen_branches:
                     continue
                 seen_branches.add(branch_key)
-                value = estimate_branch_value(vtype, pname, path, tech_stack, "url_inferred")
+                value = estimate_branch_value(vtype, pname, path, tech_stack, "url_inferred", focus_vuln_types=focus_vuln_types)
                 value += _random.uniform(-0.05, 0.05)  # v5: 随机抖动打破同质化
                 value = max(0.05, min(1.0, value))
                 child = tree.create_child_node(
@@ -426,7 +445,7 @@ async def lats_init_tree_node(state: dict) -> dict:
                 if bk in seen_branches:
                     continue
                 seen_branches.add(bk)
-                val = max(0.3, estimate_branch_value(vt, fb_param, path, tech_stack, "fallback") - 0.15)
+                val = max(0.3, estimate_branch_value(vt, fb_param, path, tech_stack, "fallback", focus_vuln_types=focus_vuln_types) - 0.15)
                 val += _random.uniform(-0.03, 0.03)
                 child = tree.create_child_node(
                     parent=root, action="explore_fallback",
@@ -443,7 +462,7 @@ async def lats_init_tree_node(state: dict) -> dict:
         if branch_key in seen_branches:
             continue
         seen_branches.add(branch_key)
-        value = estimate_branch_value(vtype, "", target_path, tech_stack, "url_inferred")
+        value = estimate_branch_value(vtype, "", target_path, tech_stack, "url_inferred", focus_vuln_types=focus_vuln_types)
         value += _random.uniform(-0.05, 0.05)
         value = max(0.05, min(1.0, value))
         child = tree.create_child_node(

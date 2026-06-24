@@ -92,6 +92,7 @@ def estimate_branch_value(
     endpoint: str,
     tech_stack: list[str] | None = None,
     source: str = "",
+    focus_vuln_types: list[str] | None = None,
 ) -> float:
     """
     初始价值评估（先验）
@@ -139,6 +140,10 @@ def estimate_branch_value(
         "dir_scan": 0.0,
     }
     base += source_bonus.get(source, 0.0)
+
+    # v14: 任务目标对齐 — focus bonus +0.35
+    if focus_vuln_types and vuln_type in focus_vuln_types:
+        base += 0.35
 
     # 技术栈关联
     if tech_stack:
