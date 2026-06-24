@@ -552,27 +552,24 @@ class ExpansionEngine:
         cycle: int,
         base_url: str,
     ) -> list[SearchNode]:
-        """为单个发现创建搜索分支"""
+        """为单个发现创建搜索分支 (v13: 单个发现失败不影响其他)"""
         created = []
-
-        if discovery.discovery_type == DiscoveryType.NEW_ENDPOINT:
-            created.extend(self._create_endpoint_branches(tree, parent, discovery, cycle, base_url))
-
-        elif discovery.discovery_type == DiscoveryType.NEW_PARAM:
-            created.extend(self._create_param_branches(tree, parent, discovery, cycle))
-
-        elif discovery.discovery_type == DiscoveryType.WAF_BYPASS_FOUND:
-            created.extend(self._create_bypass_branches(tree, parent, discovery, cycle))
-
-        elif discovery.discovery_type == DiscoveryType.TECH_DISCOVERY:
-            created.extend(self._create_tech_branches(tree, parent, discovery, cycle))
-
-        elif discovery.discovery_type == DiscoveryType.VULN_TYPE_CLUE:
-            created.extend(self._create_vuln_clue_branch(tree, parent, discovery, cycle))
-
-        elif discovery.discovery_type == DiscoveryType.AUTH_CONTEXT_CHANGE:
-            created.extend(self._create_auth_branches(tree, parent, discovery, cycle))
-
+        try:
+            if discovery.discovery_type == DiscoveryType.NEW_ENDPOINT:
+                created.extend(self._create_endpoint_branches(tree, parent, discovery, cycle, base_url))
+            elif discovery.discovery_type == DiscoveryType.NEW_PARAM:
+                created.extend(self._create_param_branches(tree, parent, discovery, cycle))
+            elif discovery.discovery_type == DiscoveryType.WAF_BYPASS_FOUND:
+                created.extend(self._create_bypass_branches(tree, parent, discovery, cycle))
+            elif discovery.discovery_type == DiscoveryType.TECH_DISCOVERY:
+                created.extend(self._create_tech_branches(tree, parent, discovery, cycle))
+            elif discovery.discovery_type == DiscoveryType.VULN_TYPE_CLUE:
+                created.extend(self._create_vuln_clue_branch(tree, parent, discovery, cycle))
+            elif discovery.discovery_type == DiscoveryType.AUTH_CONTEXT_CHANGE:
+                created.extend(self._create_auth_branches(tree, parent, discovery, cycle))
+        except Exception as e:
+            logger.warning("_create_branches_for_discovery failed for %s: %s",
+                          discovery.discovery_type.value, str(e))
         return created
 
     def _create_endpoint_branches(
@@ -804,10 +801,14 @@ class ExpansionEngine:
         return created
 
     def _get_quota_extra(self, discovery: Discovery) -> dict:
-        """从发现中提取配额追踪所需的额外信息"""
+        """从发现中提取配额追踪所需的额外信息 (v13: filter_rules 防御)"""
+        # v13: filter_rules 可能为字符串, 安全提取
+        filter_rules = discovery.data.get("filter_rules", {})
+        if not isinstance(filter_rules, dict):
+            filter_rules = {}
         return {
             "endpoint": discovery.data.get("endpoint", discovery.data.get("url", "")),
-            "technique": discovery.data.get("technique", discovery.data.get("filter_rules", {}).get("bypass", "unknown")),
+            "technique": discovery.data.get("technique", filter_rules.get("bypass", "unknown")),
             "tech_name": discovery.data.get("tech_name", "unknown"),
         }
 
