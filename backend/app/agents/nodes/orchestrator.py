@@ -413,7 +413,7 @@ async def orchestrator_node(state: VulnHuntState) -> dict:
         ]
 
         llm = _get_llm_client()
-        response_text = await llm.call(agent="orchestrator", messages=messages)
+        response_text = await llm.call(agent="orchestrator", messages=messages, task_id=task_id)
         decision = _parse_orchestrator_response(response_text)
 
         await emit(task_id, "orchestrator", "progress", {
@@ -569,7 +569,7 @@ async def orchestrator_node(state: VulnHuntState) -> dict:
     ]
 
     llm = _get_llm_client()
-    response_text = await llm.call(agent="orchestrator", messages=messages)
+    response_text = await llm.call(agent="orchestrator", messages=messages, task_id=task_id)
     decision = _parse_orchestrator_response(response_text)
 
     next_action = decision.get("next_action", "hypothesize")

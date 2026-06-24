@@ -124,7 +124,7 @@ async def lats_recon_node(state: dict) -> dict:
         )},
     ]
 
-    response_text = await llm.call(agent="orchestrator", messages=messages)
+    response_text = await llm.call(agent="orchestrator", messages=messages, task_id=task_id)
 
     try:
         decision = json.loads(response_text)

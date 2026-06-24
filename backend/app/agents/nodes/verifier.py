@@ -603,7 +603,7 @@ async def verifier_node(state: VulnHuntState) -> dict:
             )},
         ]
 
-        response_text = await llm.call(agent="verifier", messages=messages)
+        response_text = await llm.call(agent="verifier", messages=messages, task_id=task_id)
         result = _parse_verifier_response(response_text)
 
         # 最终判断: 必须有工具证据才能确认漏洞

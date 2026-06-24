@@ -177,6 +177,12 @@ class AgentRunner:
                 logger.info("lats_graph_start", task_id=task_id, max_iterations=max_iterations,
                             effective_max=effective_max, task_config_keys=list(task_config.keys())[:10])
                 initial_state = create_lats_initial_state(task_id, task_config, max_cycles=effective_max)
+                # v12: 创建 TokenBudget 并绑定到 LLMClient 单例
+                from app.agents.lats import graph as lats_graph
+                from app.agents.token_budget import TokenBudget
+                llm = lats_graph._get_llm_client()
+                if llm.token_budget is None:
+                    llm.token_budget = TokenBudget(task_id=task_id, total_budget=500_000)
             else:
                 from app.agents.graph import build_vuln_hunt_graph, create_initial_state
                 graph = build_vuln_hunt_graph()

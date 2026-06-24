@@ -86,7 +86,7 @@ async def _generate_recommendations(findings: list, target_profile: dict) -> lis
     ]
 
     try:
-        response_text = await llm.call(agent="orchestrator", messages=messages)
+        response_text = await llm.call(agent="orchestrator", messages=messages, task_id=task_id)
         recommendations = json.loads(response_text)
         if isinstance(recommendations, list):
             return recommendations[:10]

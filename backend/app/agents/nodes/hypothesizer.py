@@ -96,7 +96,7 @@ async def hypothesizer_node(state: VulnHuntState) -> dict:
 
     # 调用 LLM
     llm = _get_llm_client()
-    response_text = await llm.call(agent="hypothesizer", messages=messages)
+    response_text = await llm.call(agent="hypothesizer", messages=messages, task_id=task_id)
 
     # 解析响应为假设列表
     raw_hypotheses = _parse_hypothesizer_response(response_text)
