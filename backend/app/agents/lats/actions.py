@@ -625,27 +625,27 @@ async def _execute_discover_params(params: dict, context: ExecutionContext, regi
             seen.add(d["name"])
             unique.append(d)
 
-    # v7: 如果未发现, 从 URL 推断参数建议
+    # v10: URL 推断参数合并到 found_params, 确保 Agent 将其视为有效参数
     inferred_hints = []
-    if not unique:
-        try:
-            from app.agents.lats.graph import _infer_params_from_url
-            inferred = _infer_params_from_url(url)
-            inferred_hints = [p["name"] for p in inferred[:5]]
-        except Exception:
-            pass
+    try:
+        from app.agents.lats.graph import _infer_params_from_url
+        inferred = _infer_params_from_url(url)
+        for p in inferred[:5]:
+            pname = p["name"]
+            if pname not in seen:
+                seen.add(pname)
+                unique.append({"name": pname, "method": "GET", "evidence": "url_inferred"})
+                inferred_hints.append(pname)
+    except Exception:
+        inferred_hints = []
 
     return Observation(
         success=True,
-        summary=(f"参数发现: {[d['name'] for d in unique[:10]]}" if unique else
-                 f"未发现有效参数, URL推断: {inferred_hints}" if inferred_hints else
-                 "未发现有效参数"),
-        new_info_gained=bool(unique) or bool(inferred_hints),
-        new_facts=([f"发现有效参数: {[d['name'] for d in unique[:10]]}"] if unique else
-                   [f"URL推断参数(建议直接用 inject_payload 测试): {inferred_hints}"] if inferred_hints else
-                   []),
+        summary=f"参数发现: {[d['name'] for d in unique[:10]]}" if unique else "未发现有效参数",
+        new_info_gained=bool(unique),
+        new_facts=[f"发现有效参数 ({len(unique)}个): {[d['name'] for d in unique[:10]]}"] if unique else [],
         tool_call={"tool": "http_request", "params": {"discover": True},
-                   "result": {"found_params": unique, "inferred_params": inferred_hints}},
+                   "result": {"found_params": unique}},
     )
 
 
@@ -1013,7 +1013,8 @@ async def _execute_deep_crawl(params: dict, context: ExecutionContext, registry)
         summary=f"深度爬取: urls={len(urls)}, forms={len(forms)}, params={len(parameters)} ({param_str})",
         new_info_gained=bool(urls or forms or parameters),
         new_facts=new_facts,
-        tool_call={"tool": "deep_crawl", "params": {"url": url}, "result": {"urls": urls[:20], "forms": forms[:5]}},
+        tool_call={"tool": "deep_crawl", "params": {"url": url},
+                   "result": {"urls": urls, "forms": forms, "parameters": parameters}},  # v10: 不截断, 全量传给扩展引擎
     )
 
 
