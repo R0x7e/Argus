@@ -138,6 +138,8 @@ def estimate_branch_value(
         "form": 0.05,
         "crawl": 0.03,
         "dir_scan": 0.0,
+        "target_url": 0.08,   # v18: URL query string 直接提取, 高置信度
+        "url_inferred": 0.06,
     }
     base += source_bonus.get(source, 0.0)
 

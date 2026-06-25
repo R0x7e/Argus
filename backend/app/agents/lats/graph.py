@@ -317,9 +317,20 @@ async def lats_init_tree_node(state: dict) -> dict:
                 focus_vuln_types = types
                 break
     if focus_vuln_types:
-        bb.focus_vuln_types = focus_vuln_types  # 存入 blackboard 供选择器使用
+        bb.focus_vuln_types = focus_vuln_types
 
-    await emit(task_id, "lats_init", "agent_started", {"node": "init_tree"})
+    # v18: URL 模式自动分类 — 整站 vs 单页
+    from urllib.parse import urlparse as _urlparse
+    parsed_target = _urlparse(target_url) if target_url else None
+    target_path = parsed_target.path if parsed_target else "/"
+    is_single_page = bool(parsed_target and parsed_target.path and
+                          any(parsed_target.path.lower().endswith(ext)
+                              for ext in ('.php', '.asp', '.aspx', '.jsp', '.py', '.pl', '.cgi', '.do', '.action')))
+    is_single_page = is_single_page or bool(parsed_target and parsed_target.query)
+    scan_mode = "single_page" if is_single_page else "full_site"
+    logger.info("init_tree scan_mode=%s target=%s", scan_mode, target_url)
+
+    await emit(task_id, "lats_init", "agent_started", {"node": "init_tree", "scan_mode": scan_mode})
 
     tree = SearchTree()
 
@@ -350,7 +361,27 @@ async def lats_init_tree_node(state: dict) -> dict:
     branches_created = 0
     seen_branches = set()
 
-    for endpoint in attack_surface.get("endpoints", []):
+    # v18: 单页模式 — 仅为目标 URL 创建分支
+    if scan_mode == "single_page":
+        # 确保目标 URL 本身作为端点被处理
+        if target_path and target_path != "/":
+            single_endpoints = [{"path": target_path, "params": [], "source": "target_url"}]
+            # 从 query string 提取参数
+            if parsed_target and parsed_target.query:
+                from urllib.parse import parse_qs as _parse_qs
+                try:
+                    qs_params = list(_parse_qs(parsed_target.query).keys())
+                    single_endpoints[0]["params"] = qs_params
+                    logger.info("single_page: extracted params from URL: %s", qs_params)
+                except Exception:
+                    pass
+        else:
+            single_endpoints = [{"path": target_path or "/", "params": [], "source": "target_url"}]
+        endpoints_to_process = single_endpoints
+    else:
+        endpoints_to_process = attack_surface.get("endpoints", [])
+
+    for endpoint in endpoints_to_process:
         if isinstance(endpoint, str):
             endpoint = {"path": endpoint, "params": [], "source": "llm"}
         path = endpoint.get("path", "")
@@ -475,14 +506,15 @@ async def lats_init_tree_node(state: dict) -> dict:
         child.status = NodeStatus.SEED
         branches_created += 1
 
-    # v9: 分层剪枝 — SEED/PROMOTED/HIGH_SIGNAL 不剪, 仅对 LOW_SIGNAL 排序剪枝
-    if branches_created > 120:
+    # v9/v18: 分层剪枝 — 单页模式用更小的上限
+    prune_limit = 40 if scan_mode == "single_page" else 120
+    if branches_created > prune_limit:
         all_children = [tree.get_node(cid) for cid in root.children]
         # 先保留高优先级节点
         keep = [n for n in all_children if n and n.status in (
             NodeStatus.SEED, NodeStatus.PROMOTED, NodeStatus.HIGH_SIGNAL,
         )]
-        remaining_slots = 120 - len(keep)
+        remaining_slots = prune_limit - len(keep)
         # 对 LOW_SIGNAL 节点按 val 排序, 保留前 remaining_slots 个
         low_sig = [n for n in all_children if n and n.status == NodeStatus.LOW_SIGNAL]
         low_sig.sort(key=lambda n: n.value_estimate, reverse=True)
@@ -490,13 +522,13 @@ async def lats_init_tree_node(state: dict) -> dict:
         # Prune LOW_SIGNAL beyond limit
         for node in low_sig[remaining_slots:]:
             tree.prune_node(node.id)
-        pruned_count = max(0, branches_created - 120)
+        pruned_count = max(0, branches_created - prune_limit)
     else:
         pruned_count = 0
 
     await emit(task_id, "lats_init", "tree_initialized", {
         "branches": branches_created,
-        "pruned_to": min(branches_created, 120),
+        "pruned_to": min(branches_created, prune_limit),
     })
     await emit(task_id, "lats_init", "agent_stopped", {"node": "init_tree"})
 
