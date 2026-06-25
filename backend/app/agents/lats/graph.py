@@ -738,8 +738,19 @@ async def lats_react_execute_node(state: dict) -> dict:
             node_for_check = tree.get_node(result.node_id)
             if node_for_check and node_for_check.value_estimate > 0.55:
                 node_for_check.status = NodeStatus.NEEDS_EXPANSION
+                # v17: 记录回溯原因, 避免重复进入相同方向
+                node_for_check.observation_summary = f"backtracked: {result.status}"
             else:
                 tree.mark_exhausted(result.node_id)
+                # v17: 记录 vuln_type 失败到知识库
+                if node_for_check and bb.shared_knowledge:
+                    try:
+                        import asyncio
+                        asyncio.ensure_future(
+                            bb.shared_knowledge.record_vuln_type_failure(node_for_check.state.vuln_type)
+                        )
+                    except Exception:
+                        pass
 
         elif result.status == "step_limit":
             if result.reward > 0.2:

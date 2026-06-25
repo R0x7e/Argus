@@ -236,10 +236,14 @@ class SearchTree:
         knowledge_score = self._knowledge_score(node, knowledge) if knowledge else 0.0
         # v14: 任务目标对齐 — focus bonus
         focus_bonus = self.FOCUS_BONUS if (self.focus_vuln_types and node.state.vuln_type in self.focus_vuln_types) else 0.0
+        # v17: vuln_type 失败惩罚 — 某类型节点持续失败时降低其权重
+        vuln_penalty = 0.0
+        if knowledge and hasattr(knowledge, 'get_vuln_type_penalty'):
+            vuln_penalty = knowledge.get_vuln_type_penalty(node.state.vuln_type)
         if node.visit_count == 0:
-            return (alpha_val * exploitation + gamma_val * prior + self.DIVERSITY_WEIGHT * diversity + self.RECENCY_WEIGHT * recency + self.KNOWLEDGE_WEIGHT * knowledge_score + focus_bonus)
+            return (alpha_val * exploitation + gamma_val * prior + self.DIVERSITY_WEIGHT * diversity + self.RECENCY_WEIGHT * recency + self.KNOWLEDGE_WEIGHT * knowledge_score + focus_bonus - vuln_penalty)
         freshness = 1.0 / (1.0 + 0.01 * (s - node.last_visit_step))
-        return (alpha_val * exploitation + beta_val * exploration + gamma_val * prior + self.DIVERSITY_WEIGHT * diversity + self.RECENCY_WEIGHT * recency + self.KNOWLEDGE_WEIGHT * knowledge_score + focus_bonus) * freshness
+        return (alpha_val * exploitation + beta_val * exploration + gamma_val * prior + self.DIVERSITY_WEIGHT * diversity + self.RECENCY_WEIGHT * recency + self.KNOWLEDGE_WEIGHT * knowledge_score + focus_bonus - vuln_penalty) * freshness
 
     def _is_too_similar(self, node: SearchNode, selected: list[SearchNode]) -> bool:
         for sel in selected:

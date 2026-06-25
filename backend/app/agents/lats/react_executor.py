@@ -100,6 +100,7 @@ async def react_agent_loop(
     steps: list[ThoughtStep] = []
     accumulated_reward = 0.0
     consecutive_no_info = 0
+    consecutive_tool_errors = 0  # v17: 连续工具异常计数
 
     for step_idx in range(max_steps):
         # === Thought: 调用 LLM 决定下一步 ===
@@ -229,6 +230,20 @@ async def react_agent_loop(
         except Exception:
             pass  # 知识库记录失败不影响核心流程
 
+        # === v17: 工具异常检测 ===
+        if observation.success and not observation.new_info_gained:
+            pass  # 正常执行但无发现
+        elif not observation.success:
+            consecutive_tool_errors += 1
+        else:
+            consecutive_tool_errors = 0
+
+        # 连续 2 次工具异常 → 自动回溯, 切换工具
+        if consecutive_tool_errors >= 2:
+            logger.info("连续 %d 次工具异常，自动回溯", consecutive_tool_errors)
+            return ReactResult(node_id=node.id, status="backtrack", steps=steps,
+                reward=accumulated_reward, error=f"consecutive_tool_errors={consecutive_tool_errors}")
+
         # === 计算奖励 ===
         step_reward = compute_reward(observation)
         accumulated_reward += step_reward
@@ -284,14 +299,19 @@ async def react_agent_loop(
                 finding=observation.finding,
             )
 
-        # === 跟踪连续无信息步 ===
-        if observation.new_info_gained:
+        # === v17: 跟踪连续无信息步 ===
+        step_is_info = observation.new_info_gained
+        # batch_inject 无异常时也计为 no_info (虽然 success=true 但无实际进展)
+        obs_lower = (observation.summary or "").lower()
+        if "all baseline" in obs_lower or "全部与基线相同" in obs_lower:
+            step_is_info = False
+        if step_is_info:
             consecutive_no_info = 0
         else:
             consecutive_no_info += 1
 
-        # 连续 4 步无信息 → 自动回溯
-        if consecutive_no_info >= 4:
+        # v17: 连续 3 步无信息 → 自动回溯 (曾为 4)
+        if consecutive_no_info >= 3:
             logger.info("连续 %d 步无新信息，自动回溯", consecutive_no_info)
             return ReactResult(
                 node_id=node.id,

@@ -98,6 +98,10 @@ class SharedKnowledge:
         # ── 认证上下文 ──
         self.auth_contexts: list[dict[str, Any]] = []
 
+        # ── v17: 漏洞类型失败追踪 ──
+        self.vuln_type_failures: dict[str, int] = {}     # {"rce": 3, "sql_injection": 0}
+        self.vuln_type_successes: dict[str, int] = {}    # 成功发现数
+
         # ── 探索历史 ──
         self.exploration_history: list[dict[str, Any]] = []
 
@@ -250,6 +254,26 @@ class SharedKnowledge:
         async with self._lock:
             self.auth_contexts.append(context)
             self._recent_changes.append("auth_context")
+
+    async def record_vuln_type_failure(self, vuln_type: str) -> None:
+        """v17: 记录漏洞类型失败 (exhaust 时调用)"""
+        async with self._lock:
+            self.vuln_type_failures[vuln_type] = self.vuln_type_failures.get(vuln_type, 0) + 1
+            self._recent_changes.append("vuln_type_failure")
+
+    async def record_vuln_type_success(self, vuln_type: str) -> None:
+        """v17: 记录漏洞类型成功 (finding 时调用)"""
+        async with self._lock:
+            self.vuln_type_successes[vuln_type] = self.vuln_type_successes.get(vuln_type, 0) + 1
+
+    def get_vuln_type_penalty(self, vuln_type: str) -> float:
+        """v17: 获取漏洞类型惩罚权重 (失败越多, 惩罚越大)"""
+        failures = self.vuln_type_failures.get(vuln_type, 0)
+        if failures >= 5:
+            return 0.3   # 5+ 失败 → 降低 30%
+        elif failures >= 3:
+            return 0.15  # 3-4 失败 → 降低 15%
+        return 0.0
 
     async def record_exploration(
         self,
