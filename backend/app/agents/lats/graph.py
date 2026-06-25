@@ -79,6 +79,7 @@ class LATSState(TypedDict):
     expansion_candidates: list
     discoveries: list
     expansion_stats: dict
+    strategy_hints: dict  # v15: eval → select 反馈通道
 
 
 # ──── Node: Recon ────
@@ -525,7 +526,14 @@ async def lats_mcts_select_node(state: dict) -> dict:
 
     await emit(task_id, "lats_mcts", "agent_started", {"node": "mcts_select", "cycle": cycle})
 
-    batch_size = pool.max_concurrent
+    # v15: 动态 batch_size — 有发现时加并发, 无进展时减并发
+    dry = state.get("dry_cycles", 0)
+    if dry == 0:
+        batch_size = min(6, pool.max_concurrent + 2)
+    elif dry <= 2:
+        batch_size = pool.max_concurrent
+    else:
+        batch_size = max(2, pool.max_concurrent - 1)
     selected = tree.select_batch(
         batch_size=batch_size,
         current_cycle=cycle,
@@ -736,6 +744,14 @@ async def lats_react_execute_node(state: dict) -> dict:
         elif result.status == "step_limit":
             if result.reward > 0.2:
                 node.status = NodeStatus.NEEDS_EXPANSION
+                # v15: 触发深度扩展 — 为 NEEDS_EXPANSION 节点创建子方向
+                engine = _get_expansion_engine()
+                depth_children = engine.expand_node_for_depth(tree, node, cycle)
+                if depth_children:
+                    await emit(task_id, "lats_react", "depth_expansion", {
+                        "parent_node": node.id[:8], "vuln_type": node.state.vuln_type,
+                        "depth": node.depth, "children": len(depth_children),
+                    })
             else:
                 tree.mark_exhausted(result.node_id)
 
@@ -990,12 +1006,23 @@ async def lats_evaluate_node(state: dict) -> dict:
 
     await emit(task_id, "lats_eval", "agent_stopped", {"node": "evaluate"})
 
+    # v15: eval → select 反馈
+    bb_focus = getattr(bb, 'focus_vuln_types', None) or tree.focus_vuln_types
+    strategy_hints = {
+        "dry_cycles": dry_cycles,
+        "should_focus": dry_cycles >= 2,
+        "new_branches_this_cycle": expansion_stats.get("new_branches", 0),
+        "focus_vuln_types": bb_focus,
+        "total_nodes": tree_stats.get("total_nodes", 0),
+    }
+
     return {
         "current_cycle": cycle + 1,
         "dry_cycles": dry_cycles,
         "search_tree": tree,
         "blackboard": bb,
         "expansion_stats": expansion_stats,
+        "strategy_hints": strategy_hints,
         "events": [{
             "id": str(uuid.uuid4()),
             "agent": "lats_eval",
@@ -1121,4 +1148,5 @@ def create_lats_initial_state(
         "expansion_candidates": [],
         "discoveries": [],
         "expansion_stats": {},
+        "strategy_hints": {},
     }
