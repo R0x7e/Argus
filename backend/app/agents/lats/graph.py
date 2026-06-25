@@ -828,12 +828,10 @@ async def lats_expand_node(state: dict) -> dict:
 
     await emit(task_id, "lats_expand", "agent_started", {"node": "expand", "cycle": cycle})
 
-    # v13: 全局异常保护 — expand 崩溃不应导致任务失败
-    try:
-        engine = _get_expansion_engine()
-        extractor = engine.discovery_extractor
+    engine = _get_expansion_engine()
+    extractor = engine.discovery_extractor
 
-        # 1. 从 ReAct 结果中提取发现
+    # 1. 从 ReAct 结果中提取发现
     all_discoveries: list[Discovery] = []
     for result in react_results:
         if result is None:
@@ -885,26 +883,38 @@ async def lats_expand_node(state: dict) -> dict:
 
     await emit(task_id, "lats_expand", "agent_stopped", {"node": "expand"})
 
+    # v18-fix: engine.expand 异常保护 (修复 v13 缩进语法错误)
+    try:
+        expansion_result = engine.expand(
+            tree=tree, discoveries=unique_discoveries,
+            current_cycle=cycle, base_url=target_url, knowledge=knowledge,
+        )
     except Exception as e:
-        logger.error("lats_expand_node failed (non-fatal): %s", str(e))
-        await emit(task_id, "lats_expand", "expansion_complete", {
-            "error": str(e)[:200],
-            "tree_stats": tree.stats(),
-        })
-        await emit(task_id, "lats_expand", "agent_stopped", {"node": "expand", "error": str(e)[:100]})
-        return {
-            "search_tree": tree,
-            "discoveries": [],
-            "expansion_stats": {"error": str(e)[:200], "new_branches": 0},
-            "blackboard": bb,
-            "events": [{
-                "id": str(uuid.uuid4()),
-                "agent": "lats_expand",
-                "type": "expansion_complete",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "data": {"error": str(e)[:200]},
-            }],
-        }
+        logger.error("engine.expand failed (non-fatal): %s", str(e))
+        expansion_result = {"error": str(e)[:200], "new_branches": 0, "resurrected": 0, "by_type": {}}
+
+    tree_stats = tree.stats()
+
+    await emit(task_id, "lats_expand", "expansion_complete", {
+        **expansion_result,
+        "tree_stats": tree_stats,
+        "graveyard": tree.get_graveyard_stats(),
+        "knowledge_summary": knowledge.get_summary() if knowledge else {},
+    })
+
+    return {
+        "search_tree": tree,
+        "discoveries": [d.data for d in unique_discoveries],
+        "expansion_stats": expansion_result,
+        "blackboard": bb,
+        "events": [{
+            "id": str(uuid.uuid4()),
+            "agent": "lats_expand",
+            "type": "expansion_complete",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": expansion_result,
+        }],
+    }
 
 
 async def _sync_discoveries_to_knowledge(
