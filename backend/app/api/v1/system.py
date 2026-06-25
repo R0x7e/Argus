@@ -10,9 +10,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import get_current_user
 from app.dependencies import get_db
 from app.models.finding import Finding
 from app.models.task import Task
+from app.models.user import User
 from app.schemas.common import ApiResponse
 
 logger = logging.getLogger(__name__)
@@ -68,6 +70,7 @@ async def health_check(
 @router.get("/stats", response_model=ApiResponse, summary="系统统计")
 async def system_stats(
     db: AsyncSession = Depends(get_db),
+    _user: User = Depends(get_current_user),
 ) -> ApiResponse:
     """
     系统统计信息

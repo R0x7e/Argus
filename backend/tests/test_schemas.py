@@ -18,11 +18,13 @@ class TestTaskCreate:
     def test_valid_task(self):
         task = TaskCreate(
             name="测试任务",
-            target_url="https://example.com",
-            task_type="web_scan",
+            target_type="web",
+            target_config={"target_url": "https://example.com"},
+            strategy="web_broad",
         )
         assert task.name == "测试任务"
-        assert task.target_url == "https://example.com"
+        assert task.target_type == "web"
+        assert task.target_config["target_url"] == "https://example.com"
 
     def test_missing_required_field(self):
         with pytest.raises(ValidationError):
@@ -31,25 +33,48 @@ class TestTaskCreate:
     def test_default_config(self):
         task = TaskCreate(
             name="test",
-            target_url="https://example.com",
-            task_type="web_scan",
+            target_type="web",
+            target_config={"target_url": "https://example.com"},
+            strategy="web_broad",
         )
-        assert task.config == {} or task.config is not None
+        assert task.config == {}
+
+    def test_max_iterations_default(self):
+        task = TaskCreate(
+            name="test",
+            target_type="api",
+            target_config={"target_url": "https://api.example.com"},
+            strategy="api_focused",
+        )
+        assert task.max_iterations == 5
+
+    def test_invalid_target_type(self):
+        with pytest.raises(ValidationError):
+            TaskCreate(
+                name="test",
+                target_type="invalid_type",
+                target_config={},
+                strategy="web_broad",
+            )
 
 
 class TestFindingEnums:
     """Finding 枚举值测试"""
 
     def test_severity_values(self):
-        assert FindingSeverity.CRITICAL == "critical"
-        assert FindingSeverity.HIGH == "high"
-        assert FindingSeverity.MEDIUM == "medium"
-        assert FindingSeverity.LOW == "low"
+        assert FindingSeverity.critical == "critical"
+        assert FindingSeverity.high == "high"
+        assert FindingSeverity.medium == "medium"
+        assert FindingSeverity.low == "low"
+        assert FindingSeverity.info == "info"
 
     def test_status_values(self):
-        assert FindingStatus.UNCONFIRMED == "unconfirmed"
-        assert FindingStatus.CONFIRMED == "confirmed"
-        assert FindingStatus.FALSE_POSITIVE == "false_positive"
+        assert FindingStatus.draft == "draft"
+        assert FindingStatus.pending_verification == "pending_verification"
+        assert FindingStatus.verified == "verified"
+        assert FindingStatus.reported == "reported"
+        assert FindingStatus.fixed == "fixed"
+        assert FindingStatus.rejected == "rejected"
 
 
 class TestPaginatedResponse:
@@ -61,8 +86,8 @@ class TestPaginatedResponse:
             total=10,
             page=1,
             page_size=2,
-            total_pages=5,
         )
         assert len(resp.items) == 2
         assert resp.total == 10
-        assert resp.total_pages == 5
+        assert resp.page == 1
+        assert resp.page_size == 2

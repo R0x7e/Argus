@@ -37,9 +37,24 @@ logger = logging.getLogger(__name__)
 _llm_client: LLMClient | None = None
 _executor_pool: ReactExecutorPool | None = None
 _expansion_engine: ExpansionEngine | None = None
+# 每任务独立的 LLM 客户端实例，避免并发任务间状态污染
+_task_llm_clients: dict[str, LLMClient] = {}
 
 
-def _get_llm_client() -> LLMClient:
+def register_task_llm_client(task_id: str, client: LLMClient) -> None:
+    """注册任务专属的 LLM 客户端实例"""
+    _task_llm_clients[task_id] = client
+
+
+def unregister_task_llm_client(task_id: str) -> None:
+    """清理任务专属的 LLM 客户端实例"""
+    _task_llm_clients.pop(task_id, None)
+
+
+def _get_llm_client(task_id: str = "") -> LLMClient:
+    """获取 LLM 客户端：优先使用任务专属实例，回退到全局单例"""
+    if task_id and task_id in _task_llm_clients:
+        return _task_llm_clients[task_id]
     global _llm_client
     if _llm_client is None:
         _llm_client = LLMClient()
@@ -109,7 +124,7 @@ async def lats_recon_node(state: dict) -> dict:
         "forms_found": len(recon_results.get("forms", [])),
     })
 
-    llm = _get_llm_client()
+    llm = _get_llm_client(task_id)
     messages = [
         {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT},
         {"role": "user", "content": (
@@ -638,11 +653,11 @@ async def lats_react_execute_node(state: dict) -> dict:
     host = parsed.hostname or "localhost"
 
     context = ExecutionContext(
-        task_id=task_id, target_host=host, timeout=30, max_retries=2,
+        task_id=task_id,
+        target_host=host,
+        timeout=30,
+        max_retries=2,
         allowed_hosts=[host],
-        auth_headers=task_config.get("auth_headers", {}),
-        cookies=task_config.get("cookies", {}),
-        auth_token=task_config.get("auth_token", ""),
     )
 
     nodes = [tree.get_node(nid) for nid in selected_ids if tree.get_node(nid)]
@@ -719,7 +734,7 @@ async def lats_react_execute_node(state: dict) -> dict:
     steering_directives = bb.steering_directives if hasattr(bb, 'steering_directives') and bb.steering_directives else None
 
     pool = _get_executor_pool()
-    llm = _get_llm_client()
+    llm = _get_llm_client(task_id)
     results = await pool.execute_batch(
         nodes, context, llm, max_steps,
         steering_directives=steering_directives,
@@ -1113,12 +1128,12 @@ async def lats_evaluate_node(state: dict) -> dict:
 
 def route_from_evaluate(state: dict) -> str:
     """评估节点的路由决策 (v2: 考虑新状态 + Graveyard 复活)"""
-    tree: SearchTree = state.get("search_tree")
-    cycle = state.get("current_cycle", 0)
-    max_cycles = state.get("max_cycles", 15)
-    dry_cycles = state.get("dry_cycles", 0)
+    tree = state.get("search_tree")
+    cycle = int(state.get("current_cycle", 0) or 0)
+    max_cycles = int(state.get("max_cycles", 15) or 15)
+    dry_cycles = int(state.get("dry_cycles", 0) or 0)
     bb = state.get("blackboard")
-    expansion_stats = state.get("expansion_stats", {})
+    expansion_stats = state.get("expansion_stats") or {}
 
     if cycle >= max_cycles:
         logger.info("达到最大搜索周期 (%d)，进入报告", max_cycles)

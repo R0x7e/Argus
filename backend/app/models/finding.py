@@ -7,7 +7,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, Index, String, Text
+from sqlalchemy import DateTime, ForeignKey, Index, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -126,6 +126,7 @@ class Finding(UUIDMixin, Base):
 
     # 验证时间
     verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
         nullable=True,
         comment="验证时间",
     )

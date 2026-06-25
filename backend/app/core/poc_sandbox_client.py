@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 class PocSandboxClient:
     def __init__(self, base_url: str):
         self._base_url = base_url.rstrip("/")
+        from app.config import get_settings
+        self._sidecar_secret = get_settings().SIDECAR_SECRET
 
     async def execute(
         self,
@@ -22,6 +24,9 @@ class PocSandboxClient:
         timeout: int = 30,
         allowed_hosts: list[str] | None = None,
     ) -> dict:
+        headers = {}
+        if self._sidecar_secret:
+            headers["X-Sidecar-Secret"] = self._sidecar_secret
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout + 10)) as client:
             resp = await client.post(
                 f"{self._base_url}/execute",
@@ -31,6 +36,7 @@ class PocSandboxClient:
                     "timeout": timeout,
                     "allowed_hosts": allowed_hosts or [target_host],
                 },
+                headers=headers,
             )
             resp.raise_for_status()
             return resp.json()

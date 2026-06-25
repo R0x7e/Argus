@@ -39,6 +39,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}/api/v1${path}`, {
     ...options,
     headers,
+    credentials: "include",  // 发送 httpOnly cookie 用于认证
   });
 
   // Token 失效时自动登出

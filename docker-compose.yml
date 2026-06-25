@@ -9,12 +9,13 @@ services:
     image: postgres:16
     container_name: argus-postgres
     restart: unless-stopped
-    ports:
-      - "5432:5432"
+    # 不暴露端口到宿主机，仅内部 Docker 网络可访问
+    expose:
+      - "5432"
     environment:
       POSTGRES_DB: argus
       POSTGRES_USER: argus
-      POSTGRES_PASSWORD: argus_dev_password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-argus_dev_password}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -22,31 +23,37 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - data-net
 
   # Redis 缓存与消息队列服务
   redis:
     image: redis:7
     container_name: argus-redis
     restart: unless-stopped
-    ports:
-      - "6379:6379"
+    expose:
+      - "6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - data-net
+      - sidecar-net
 
   # NATS 消息总线（启用 JetStream）
   nats:
     image: nats:latest
     container_name: argus-nats
     restart: unless-stopped
-    ports:
-      - "4222:4222"
-      - "8222:8222"  # HTTP 监控端口
+    expose:
+      - "4222"
     command: ["--jetstream", "--store_dir", "/data"]
     volumes:
       - nats_data:/data
+    networks:
+      - data-net
 
   # Argus 后端服务
   backend:
@@ -58,7 +65,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql+asyncpg://argus:argus_dev_password@postgres:5432/argus
+      DATABASE_URL: postgresql+asyncpg://argus:${POSTGRES_PASSWORD:-argus_dev_password}@postgres:5432/argus
       REDIS_URL: redis://redis:6379/0
       NATS_URL: nats://nats:4222
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
@@ -66,9 +73,10 @@ services:
       MITMPROXY_URL: http://mitmproxy:8080
       CRAWLERGO_URL: http://crawlergo:7777
       POC_SANDBOX_URL: http://poc-sandbox:9090
+      SIDECAR_SECRET: ${SIDECAR_SECRET:-}
       PROXY_FLOWS_CHANNEL: "proxy:flows"
-      DEBUG: "true"
-      LOG_LEVEL: info
+      DEBUG: ${DEBUG:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
     depends_on:
       postgres:
         condition: service_healthy
@@ -80,6 +88,10 @@ services:
         condition: service_healthy
       poc-sandbox:
         condition: service_healthy
+    networks:
+      - data-net
+      - sidecar-net
+      - frontend-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/system/health"]
       interval: 10s
@@ -105,6 +117,8 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+    networks:
+      - frontend-net
 
   # mitmproxy 流量代理 Sidecar
   mitmproxy:
@@ -113,8 +127,8 @@ services:
       dockerfile: Dockerfile
     container_name: argus-mitmproxy
     restart: unless-stopped
-    ports:
-      - "8080:8080"
+    expose:
+      - "8080"
     environment:
       REDIS_URL: redis://redis:6379/0
       PROXY_CHANNEL: "proxy:flows"
@@ -127,6 +141,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 5s
+    networks:
+      - sidecar-net
 
   # crawlergo 深度爬虫 Sidecar
   crawlergo:
@@ -135,8 +151,8 @@ services:
       dockerfile: Dockerfile
     container_name: argus-crawlergo
     restart: unless-stopped
-    ports:
-      - "7777:7777"
+    expose:
+      - "7777"
     environment:
       LISTEN_ADDR: "0.0.0.0:7777"
       CHROMIUM_PATH: "/usr/bin/chromium"
@@ -146,6 +162,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+    networks:
+      - sidecar-net
 
   # Python PoC 沙箱执行器
   poc-sandbox:
@@ -154,10 +172,11 @@ services:
       dockerfile: Dockerfile
     container_name: argus-poc-sandbox
     restart: unless-stopped
-    ports:
-      - "9090:9090"
+    expose:
+      - "9090"
     environment:
       LISTEN_ADDR: "0.0.0.0:9090"
+      SIDECAR_SECRET: ${SIDECAR_SECRET:-}
     deploy:
       resources:
         limits:
@@ -172,9 +191,22 @@ services:
       timeout: 5s
       retries: 5
       start_period: 5s
+    networks:
+      - sidecar-net
 
 volumes:
   postgres_data:
     driver: local
   nats_data:
     driver: local
+
+networks:
+  # 前端网络：前端 ↔ 后端
+  frontend-net:
+    driver: bridge
+  # 数据网络：后端 ↔ DB/Redis/NATS
+  data-net:
+    driver: bridge
+  # Sidecar 网络：后端 ↔ mitmproxy/crawlergo/poc-sandbox
+  sidecar-net:
+    driver: bridge

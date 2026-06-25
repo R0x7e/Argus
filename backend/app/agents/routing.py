@@ -22,10 +22,14 @@ def route_from_orchestrator(state: VulnHuntState) -> str:
     3. 当前阶段为 hypothesizing → Hypothesizer
     4. 默认 → Hypothesizer（生成新假设）
     """
-    bb = state["blackboard"]
-    iteration = state.get("iteration_count", 0)
-    max_iter = state.get("max_iterations", 5)
-    phase = state.get("current_phase", "")
+    bb = state.get("blackboard")
+    if bb is None:
+        logger.warning("路由决策: blackboard 为 None，默认路由到 hypothesizer")
+        return "hypothesizer"
+
+    iteration = int(state.get("iteration_count", 0) or 0)
+    max_iter = int(state.get("max_iterations", 5) or 5)
+    phase = str(state.get("current_phase", "") or "")
 
     logger.debug(
         "路由决策: iteration=%d/%d, phase=%s, hypotheses=%d, findings=%d",

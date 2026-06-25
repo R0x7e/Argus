@@ -14,9 +14,16 @@ COPY --from=builder /crawlergo /usr/local/bin/crawlergo
 COPY api_wrapper.py /app/api_wrapper.py
 
 WORKDIR /app
+
+# 创建非 root 用户运行（安全加固）
+RUN adduser -D -u 1002 crawluser && \
+    chown -R crawluser:crawluser /app
+
 EXPOSE 7777
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
     CMD curl -f http://localhost:7777/health || exit 1
+
+USER crawluser
 
 CMD ["python3", "/app/api_wrapper.py"]

@@ -53,6 +53,7 @@ def upgrade() -> None:
         sa.Column(
             "email",
             sa.String(200),
+            unique=True,
             nullable=False,
             comment="邮箱地址",
         ),
@@ -146,6 +147,7 @@ def upgrade() -> None:
         sa.Column(
             "created_by",
             postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("users.id", ondelete="SET NULL"),
             nullable=True,
             comment="创建者用户 ID",
         ),
@@ -269,7 +271,86 @@ def upgrade() -> None:
     op.create_index("ix_events_task_id_timestamp", "events", ["task_id", "timestamp"])
     op.create_index("ix_events_task_id_agent", "events", ["task_id", "agent"])
 
-    # === 漏洞发现表 ===
+    # === 报告表（先创建，不含 finding_id FK，解决循环依赖） ===
+    op.create_table(
+        "reports",
+        sa.Column(
+            "id",
+            postgresql.UUID(as_uuid=True),
+            server_default=sa.text("gen_random_uuid()"),
+            primary_key=True,
+            comment="主键 UUID",
+        ),
+        # 关联任务 ID（任务汇总报告）
+        sa.Column(
+            "task_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("tasks.id", ondelete="CASCADE"),
+            nullable=True,
+            comment="关联任务 ID（汇总报告）",
+        ),
+        # finding_id FK 稍后添加（解决循环依赖）
+        sa.Column(
+            "finding_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=True,
+            comment="关联漏洞发现 ID",
+        ),
+        sa.Column(
+            "format",
+            sa.String(20),
+            nullable=False,
+            comment="报告格式",
+        ),
+        sa.Column(
+            "content",
+            sa.Text,
+            nullable=False,
+            comment="报告内容",
+        ),
+        sa.Column(
+            "version",
+            sa.Integer,
+            nullable=False,
+            server_default="1",
+            comment="报告版本号",
+        ),
+        sa.Column(
+            "created_by",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("users.id", ondelete="SET NULL"),
+            nullable=True,
+            comment="创建者用户 ID",
+        ),
+        sa.Column(
+            "submitted_to",
+            postgresql.JSONB,
+            nullable=True,
+            comment="提交信息",
+        ),
+        # 报告元数据（严重级别分布等）
+        sa.Column(
+            "report_metadata",
+            postgresql.JSONB,
+            nullable=True,
+            comment="报告元数据",
+        ),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            comment="创建时间",
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            comment="更新时间",
+        ),
+        comment="漏洞报告表",
+    )
+
+    # === 漏洞发现表（reports 已存在，可安全引用） ===
     op.create_table(
         "findings",
         sa.Column(
@@ -362,6 +443,7 @@ def upgrade() -> None:
         sa.Column(
             "report_id",
             postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("reports.id", ondelete="SET NULL"),
             nullable=True,
             comment="关联报告 ID",
         ),
@@ -390,67 +472,14 @@ def upgrade() -> None:
     op.create_index("ix_findings_type_severity", "findings", ["type", "severity"])
     op.create_index("ix_findings_status", "findings", ["status"])
 
-    # === 报告表 ===
-    op.create_table(
+    # 添加 reports.finding_id 外键（findings 表已创建，解决循环依赖）
+    op.create_foreign_key(
+        "fk_reports_finding_id",
         "reports",
-        sa.Column(
-            "id",
-            postgresql.UUID(as_uuid=True),
-            server_default=sa.text("gen_random_uuid()"),
-            primary_key=True,
-            comment="主键 UUID",
-        ),
-        sa.Column(
-            "finding_id",
-            postgresql.UUID(as_uuid=True),
-            sa.ForeignKey("findings.id", ondelete="CASCADE"),
-            nullable=False,
-            comment="关联漏洞发现 ID",
-        ),
-        sa.Column(
-            "format",
-            sa.String(20),
-            nullable=False,
-            comment="报告格式",
-        ),
-        sa.Column(
-            "content",
-            sa.Text,
-            nullable=False,
-            comment="报告内容",
-        ),
-        sa.Column(
-            "version",
-            sa.Integer,
-            nullable=False,
-            server_default="1",
-            comment="报告版本号",
-        ),
-        sa.Column(
-            "created_by",
-            postgresql.UUID(as_uuid=True),
-            nullable=True,
-            comment="创建者用户 ID",
-        ),
-        sa.Column(
-            "submitted_to",
-            postgresql.JSONB,
-            nullable=True,
-            comment="提交信息",
-        ),
-        sa.Column(
-            "created_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.func.now(),
-            comment="创建时间",
-        ),
-        sa.Column(
-            "updated_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.func.now(),
-            comment="更新时间",
-        ),
-        comment="漏洞报告表",
+        "findings",
+        ["finding_id"],
+        ["id"],
+        ondelete="CASCADE",
     )
 
     # === Agent 执行记录表 ===
@@ -521,12 +550,95 @@ def upgrade() -> None:
         comment="Agent 执行记录表",
     )
 
+    # === LLM 供应商配置表 ===
+    op.create_table(
+        "llm_providers",
+        sa.Column(
+            "id",
+            postgresql.UUID(as_uuid=True),
+            server_default=sa.text("gen_random_uuid()"),
+            primary_key=True,
+            comment="主键 UUID",
+        ),
+        sa.Column(
+            "provider_type",
+            sa.String(30),
+            nullable=False,
+            comment="供应商类型: anthropic|openai|deepseek|zhipu|qwen|custom",
+        ),
+        sa.Column(
+            "display_name",
+            sa.String(100),
+            nullable=False,
+            comment="显示名称",
+        ),
+        sa.Column(
+            "api_key_encrypted",
+            sa.Text,
+            nullable=False,
+            comment="加密后的 API Key",
+        ),
+        sa.Column(
+            "base_url",
+            sa.String(500),
+            nullable=True,
+            comment="自定义 API 端点 URL",
+        ),
+        sa.Column(
+            "default_model",
+            sa.String(100),
+            nullable=False,
+            comment="默认模型 ID",
+        ),
+        sa.Column(
+            "models_available",
+            postgresql.JSONB,
+            nullable=True,
+            comment="可用模型列表",
+        ),
+        sa.Column(
+            "is_active",
+            sa.Boolean,
+            nullable=False,
+            server_default="true",
+            comment="是否启用",
+        ),
+        sa.Column(
+            "priority",
+            sa.Integer,
+            nullable=False,
+            server_default="10",
+            comment="优先级（越小越高）",
+        ),
+        sa.Column(
+            "created_by",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("users.id", ondelete="SET NULL"),
+            nullable=True,
+            comment="创建者",
+        ),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            comment="创建时间",
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            comment="更新时间",
+        ),
+        comment="LLM 供应商配置表",
+    )
+
 
 def downgrade() -> None:
     """
     降级迁移 - 按依赖逆序删除所有表
     """
     # 按外键依赖逆序删除
+    op.drop_table("llm_providers")
     op.drop_table("agent_executions")
     op.drop_table("reports")
     op.drop_index("ix_findings_status", table_name="findings")

@@ -7,6 +7,7 @@ Agent 运行器 - 管理 Agent 任务的异步执行生命周期
 
 import asyncio
 import uuid as uuid_mod
+from datetime import datetime, timezone
 from typing import Optional
 
 import structlog
@@ -167,6 +168,16 @@ class AgentRunner:
         from app.services.finding_service import FindingService
         from app.services.task_service import TaskService
 
+        # 为当前任务创建独立的 LLM 客户端实例，避免并发任务间状态污染
+        from app.agents.llm import LLMClient
+        from app.agents.token_budget import TokenBudget
+        from app.agents.lats.graph import register_task_llm_client, unregister_task_llm_client
+        from app.config import get_settings
+
+        task_llm = LLMClient()
+        task_llm.token_budget = TokenBudget(task_id=task_id, total_budget=500_000)
+        register_task_llm_client(task_id, task_llm)
+
         try:
             # 根据 mode 构建不同的图和初始状态
             if mode == "lats":
@@ -177,12 +188,6 @@ class AgentRunner:
                 logger.info("lats_graph_start", task_id=task_id, max_iterations=max_iterations,
                             effective_max=effective_max, task_config_keys=list(task_config.keys())[:10])
                 initial_state = create_lats_initial_state(task_id, task_config, max_cycles=effective_max)
-                # v12: 创建 TokenBudget 并绑定到 LLMClient 单例
-                from app.agents.lats import graph as lats_graph
-                from app.agents.token_budget import TokenBudget
-                llm = lats_graph._get_llm_client()
-                if llm.token_budget is None:
-                    llm.token_budget = TokenBudget(task_id=task_id, total_budget=500_000)
             else:
                 from app.agents.graph import build_vuln_hunt_graph, create_initial_state
                 graph = build_vuln_hunt_graph()
@@ -199,10 +204,14 @@ class AgentRunner:
                 )
                 await db.commit()
 
-            # 执行 LangGraph 图
+            # 执行 LangGraph 图（带全局超时保护）
             # v2: 将初始状态注册到活跃状态表 (供 WebSocket 用户干预)
             self._active_states[task_id] = initial_state
-            result = await graph.ainvoke(initial_state)
+            task_timeout = get_settings().TASK_TIMEOUT_SECONDS
+            result = await asyncio.wait_for(
+                graph.ainvoke(initial_state),
+                timeout=task_timeout,
+            )
 
             # 处理执行结果：持久化漏洞发现和报告
             async with self._session_factory() as db:
@@ -286,8 +295,46 @@ class AgentRunner:
             logger.info("agent_task_cancelled", task_id=task_id)
             async with self._session_factory() as db:
                 task_svc = TaskService(db)
-                await task_svc.transition_status(task_id, "terminated")
+                await task_svc.transition_status(
+                    task_id,
+                    "terminated",
+                    error_info={
+                        "error_type": "CancelledError",
+                        "message": "任务被用户手动终止",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
                 await db.commit()
+            # 同步 Agent 执行状态
+            await self._sync_agent_executions_on_failure(task_id, "任务被终止")
+
+        except asyncio.TimeoutError:
+            # 任务执行超时
+            logger.error("agent_task_timeout", task_id=task_id, timeout=task_timeout)
+            async with self._session_factory() as db:
+                task_svc = TaskService(db)
+                try:
+                    await task_svc.transition_status(
+                        task_id,
+                        "failed",
+                        error_info={
+                            "error_type": "TimeoutError",
+                            "message": f"任务执行超时 ({task_timeout}s)，已自动终止",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+                    await event_bus.publish(
+                        db=db,
+                        task_id=task_id,
+                        agent="system",
+                        event_type="error",
+                        data={"content": f"任务执行超时 ({task_timeout}s)，已自动终止"},
+                    )
+                    await db.commit()
+                except Exception:
+                    logger.error("failed_to_update_task_status", task_id=task_id)
+            # 同步 Agent 执行状态
+            await self._sync_agent_executions_on_failure(task_id, f"任务执行超时 ({task_timeout}s)")
 
         except Exception as e:
             # 任务执行失败
@@ -295,7 +342,15 @@ class AgentRunner:
             async with self._session_factory() as db:
                 task_svc = TaskService(db)
                 try:
-                    await task_svc.transition_status(task_id, "failed")
+                    await task_svc.transition_status(
+                        task_id,
+                        "failed",
+                        error_info={
+                            "error_type": type(e).__name__,
+                            "message": str(e)[:500],
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
                     await event_bus.publish(
                         db=db,
                         task_id=task_id,
@@ -307,10 +362,14 @@ class AgentRunner:
                 except Exception:
                     # 状态更新失败也不抛异常，避免掩盖原始错误
                     logger.error("failed_to_update_task_status", task_id=task_id)
+            # 同步 Agent 执行状态
+            await self._sync_agent_executions_on_failure(task_id, f"任务执行失败: {str(e)[:200]}")
 
         finally:
             # 清理内存中的任务引用
             self._cleanup(task_id)
+            # 清理任务专属的 LLM 客户端实例
+            unregister_task_llm_client(task_id)
 
     def _cleanup(self, task_id: str) -> None:
         """
@@ -321,6 +380,46 @@ class AgentRunner:
         self._tasks.pop(task_id, None)
         self._pause_events.pop(task_id, None)
         self._active_states.pop(task_id, None)  # v2
+
+    async def _sync_agent_executions_on_failure(
+        self, task_id: str, failure_reason: str
+    ) -> None:
+        """
+        任务失败/终止时，将所有关联的 Agent 执行记录状态更新为 failed/terminated
+
+        解决任务状态与 Agent 状态不一致的问题。
+        """
+        from sqlalchemy import update
+        from app.models.agent_execution import AgentExecution
+
+        try:
+            async with self._session_factory() as db:
+                # 将所有该任务下仍在 "running" 状态的 Agent 执行记录更新为失败
+                stmt = (
+                    update(AgentExecution)
+                    .where(
+                        AgentExecution.task_id == task_id,
+                        AgentExecution.status == "running",
+                    )
+                    .values(
+                        status="failed",
+                        completed_at=datetime.now(timezone.utc),
+                        summary=failure_reason,
+                    )
+                )
+                await db.execute(stmt)
+                await db.commit()
+                logger.info(
+                    "agent_executions_synced_on_failure",
+                    task_id=task_id,
+                    reason=failure_reason,
+                )
+        except Exception as e:
+            logger.error(
+                "failed_to_sync_agent_executions",
+                task_id=task_id,
+                error=str(e),
+            )
 
 
 # 全局单例占位（在 main.py lifespan 中用实际的 session_factory 初始化）

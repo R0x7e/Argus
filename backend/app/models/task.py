@@ -7,7 +7,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Index, String, Text
+from sqlalchemy import DateTime, Index, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -83,12 +83,14 @@ class Task(UUIDMixin, Base):
 
     # 任务开始时间
     started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
         nullable=True,
         comment="任务开始时间",
     )
 
     # 任务完成时间
     completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
         nullable=True,
         comment="任务完成时间",
     )

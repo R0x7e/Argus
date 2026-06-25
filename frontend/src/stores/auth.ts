@@ -33,8 +33,16 @@ export const useAuthStore = create<AuthState>()(
       login: (token, user) =>
         set({ token, user, isAuthenticated: true }),
 
-      logout: () =>
-        set({ token: null, user: null, isAuthenticated: false }),
+      logout: () => {
+        // 清除后端 httpOnly cookie
+        if (typeof window !== "undefined") {
+          fetch("/api/v1/auth/logout", {
+            method: "POST",
+            credentials: "include",
+          }).catch(() => {});
+        }
+        set({ token: null, user: null, isAuthenticated: false });
+      },
 
       setUser: (user) => set({ user }),
     }),

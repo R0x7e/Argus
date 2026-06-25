@@ -1,7 +1,7 @@
 "use client";
 
 import { useParams } from "next/navigation";
-import { useState, useRef, useCallback } from "react";
+import { useState, useCallback } from "react";
 import Link from "next/link";
 import { MainLayout } from "@/components/layout/main-layout";
 import { Badge } from "@/components/ui/badge";
@@ -36,20 +36,13 @@ export default function TaskMonitorPage() {
   const taskId = params.id as string;
   const [activeTab, setActiveTab] = useState<TabKey>("overview");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
 
   const { data: task, isLoading: taskLoading } = useTask(taskId);
-  const { events, connected } = useEventStream(taskId);
+  const { events, connected, send: wsSend } = useEventStream(taskId);
   const { data: findingsData } = useFindings(
     taskId ? { task_id: taskId } : undefined
   );
   const taskAction = useTaskAction();
-
-  const wsSend = useCallback((msg: object) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(msg));
-    }
-  }, []);
 
   const handleAction = (action: "start" | "pause" | "resume" | "terminate") => {
     taskAction.mutate({ taskId, action });

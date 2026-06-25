@@ -9,12 +9,14 @@ PoC 沙箱 Worker — 隔离执行 Python PoC 代码
 """
 
 import io
+import os
 import time
 import asyncio
 import builtins
 from contextlib import redirect_stdout, redirect_stderr
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from RestrictedPython import compile_restricted, safe_globals
 from RestrictedPython.Eval import default_guarded_getiter
@@ -22,6 +24,21 @@ from RestrictedPython.Guards import guarded_unpack_sequence, safer_getattr
 from RestrictedPython.PrintCollector import PrintCollector
 
 app = FastAPI(title="Argus PoC Sandbox")
+
+# Sidecar 认证：验证来自后端的请求携带正确的共享密钥
+SIDECAR_SECRET = os.environ.get("SIDECAR_SECRET", "")
+
+
+@app.middleware("http")
+async def verify_sidecar_secret(request: Request, call_next):
+    """验证 Sidecar 共享密钥（健康检查端点除外）"""
+    if request.url.path == "/health":
+        return await call_next(request)
+    if SIDECAR_SECRET:
+        provided = request.headers.get("X-Sidecar-Secret", "")
+        if provided != SIDECAR_SECRET:
+            return JSONResponse(status_code=403, content={"detail": "Sidecar 认证失败"})
+    return await call_next(request)
 
 ALLOWED_IMPORTS = {
     "requests", "urllib3", "base64", "json", "hashlib",

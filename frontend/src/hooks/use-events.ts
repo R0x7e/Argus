@@ -141,5 +141,22 @@ export function useEventStream(taskId: string | null) {
     setEvents([]);
   }, []);
 
-  return { events, connected, clearEvents };
+  /**
+   * 发送消息到后端（用于用户干预操作）
+   * 委托给 WebSocketManager.send，连接未建立时返回 false 并告警
+   */
+  const send = useCallback((msg: object): boolean => {
+    const manager = wsRef.current;
+    if (!manager) {
+      console.warn("[useEventStream] WebSocket 管理器未初始化，消息未发送");
+      return false;
+    }
+    const ok = manager.send(msg);
+    if (!ok) {
+      console.warn("[useEventStream] WebSocket 未连接，消息未发送");
+    }
+    return ok;
+  }, []);
+
+  return { events, connected, clearEvents, send };
 }

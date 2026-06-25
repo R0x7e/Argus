@@ -1,0 +1,98 @@
+# =============================================
+# Argus - AI 漏洞挖掘平台 .gitignore
+# =============================================
+
+# === 环境变量 & 密钥 ===
+.env
+.env.*
+!.env.example
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# 虚拟环境
+venv/
+.venv/
+env/
+ENV/
+
+# 测试 & 类型检查缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# === Node.js / Next.js ===
+node_modules/
+.next/
+out/
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
+
+# npm/yarn/pnpm
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# === Docker ===
+# 不忽略 docker-compose.yml 和 Dockerfile，但忽略本地数据
+.docker/
+
+# === 数据库 & 数据 ===
+*.db
+*.sqlite3
+*.sql.gz
+postgres_data/
+redis_data/
+nats_data/
+
+# === 日志 ===
+logs/
+*.log
+
+# === Playwright ===
+test-results/
+playwright-report/
+playwright/.cache/
+
+# === IDE & 编辑器 ===
+.idea/
+.vscode/
+.claude/settings.local.json
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# === 操作系统 ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === 安全 & 临时文件 ===
+*.pem
+*.key
+*.crt
+*.p12
+secrets/
+tmp/
+temp/

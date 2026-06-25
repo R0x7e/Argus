@@ -5,6 +5,7 @@
 """
 
 import pytest
+from pydantic import ValidationError
 
 from app.tools.base import BaseTool, ExecutionContext, RiskLevel, ToolRegistry
 from app.tools.payload_mutator import PayloadMutatorTool
@@ -18,6 +19,59 @@ def context():
         target_host="example.com",
         allowed_hosts=["example.com"],
     )
+
+
+class TestExecutionContext:
+    """ExecutionContext 类型安全测试"""
+
+    def test_valid_construction(self):
+        """合法参数应成功构造"""
+        ctx = ExecutionContext(
+            task_id="task-1",
+            target_host="example.com",
+        )
+        assert ctx.task_id == "task-1"
+        assert ctx.target_host == "example.com"
+        assert ctx.timeout == 30
+        assert ctx.max_retries == 2
+        assert ctx.allowed_hosts == []
+
+    def test_full_construction(self):
+        """全参数构造"""
+        ctx = ExecutionContext(
+            task_id="task-1",
+            target_host="example.com",
+            timeout=60,
+            max_retries=5,
+            allowed_hosts=["example.com", "test.com"],
+        )
+        assert ctx.timeout == 60
+        assert ctx.max_retries == 5
+        assert len(ctx.allowed_hosts) == 2
+
+    def test_rejects_unknown_field(self):
+        """传入未定义字段时应抛出 ValidationError"""
+        with pytest.raises(ValidationError):
+            ExecutionContext(
+                task_id="task-1",
+                target_host="example.com",
+                auth_headers={},  # 不存在的字段
+            )
+
+    def test_rejects_multiple_unknown_fields(self):
+        """多个未定义字段也应被拒绝"""
+        with pytest.raises(ValidationError):
+            ExecutionContext(
+                task_id="task-1",
+                target_host="example.com",
+                cookies={},
+                auth_token="",
+            )
+
+    def test_missing_required_field(self):
+        """缺少必填字段应抛出 ValidationError"""
+        with pytest.raises(ValidationError):
+            ExecutionContext(target_host="example.com")
 
 
 class TestRiskLevel:
@@ -43,10 +97,10 @@ class TestToolRegistry:
         retrieved = registry.get(tool.name)
         assert retrieved is tool
 
-    def test_get_unknown_returns_none(self):
+    def test_get_unknown_raises_keyerror(self):
         registry = ToolRegistry()
-        result = registry.get("nonexistent_tool")
-        assert result is None
+        with pytest.raises(KeyError):
+            registry.get("nonexistent_tool")
 
     def test_list_tools(self):
         registry = ToolRegistry()

@@ -12,8 +12,10 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import get_current_user
 from app.core.exceptions import ArgusBaseError
 from app.dependencies import get_db
+from app.models.user import User
 from app.schemas.common import ApiResponse, PaginatedResponse
 from app.schemas.event import EventFilter, EventResponse
 from app.services.event_service import EventService
@@ -37,6 +39,7 @@ async def list_events(
     after: Optional[datetime] = Query(default=None, description="起始时间（不含）"),
     before: Optional[datetime] = Query(default=None, description="截止时间（不含）"),
     db: AsyncSession = Depends(get_db),
+    _user: User = Depends(get_current_user),
 ) -> ApiResponse[PaginatedResponse[EventResponse]]:
     """
     分页查询指定任务的事件列表

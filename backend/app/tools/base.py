@@ -6,10 +6,11 @@
 """
 
 import logging
-from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any
 from urllib.parse import urlparse
+
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
@@ -30,20 +31,25 @@ class RiskLevel(IntEnum):
     L3 = 3  # 高危破坏性操作
 
 
-@dataclass
-class ExecutionContext:
+class ExecutionContext(BaseModel):
     """
     工具执行上下文
 
     携带任务信息、目标主机、超时配置和授权白名单等运行时参数。
     每次工具调用都需要传入上下文以确保安全约束。
+
+    使用 Pydantic BaseModel 并配置 extra='forbid'，
+    传入未定义的字段时会立即抛出 ValidationError，
+    避免因参数拼写错误或遗漏字段更新导致的运行时崩溃。
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     task_id: str                                    # 关联任务 ID
     target_host: str                                # 主要目标主机
     timeout: int = 30                               # 默认超时秒数
     max_retries: int = 2                            # 最大重试次数
-    allowed_hosts: list[str] = field(default_factory=list)  # 允许访问的主机白名单
+    allowed_hosts: list[str] = Field(default_factory=list)  # 允许访问的主机白名单
 
 
 class BaseTool:

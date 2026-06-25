@@ -7,7 +7,7 @@
 
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 import structlog
@@ -65,7 +65,7 @@ class EventBus:
             新创建的事件 ID
         """
         event_id = str(uuid.uuid4())
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         # 1. 持久化到数据库
         event = Event(

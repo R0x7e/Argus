@@ -13,7 +13,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.auth import get_current_user
+from app.core.auth import get_current_user, verify_task_ownership
 from app.core.exceptions import ArgusBaseError
 from app.dependencies import get_db
 from app.models.user import User
@@ -44,6 +44,10 @@ async def create_task(
     try:
         service = TaskService(db)
         task = await service.create_task(data)
+        # 记录创建者
+        task.created_by = user.id
+        await db.commit()
+        await db.refresh(task)
         return ApiResponse(
             code=201,
             message="任务创建成功",
@@ -111,10 +115,13 @@ async def update_task(
 ) -> ApiResponse[TaskResponse]:
     """更新任务信息，仅更新传入的非空字段"""
     try:
+        await verify_task_ownership(str(task_id), user, db)
         service = TaskService(db)
         task = await service.update_task(task_id, data)
         return ApiResponse(message="任务更新成功", data=TaskResponse.model_validate(task))
     except ArgusBaseError:
+        raise
+    except HTTPException:
         raise
     except Exception as e:
         logger.exception("更新任务失败: %s", str(e))
@@ -129,10 +136,13 @@ async def delete_task(
 ) -> ApiResponse:
     """删除指定任务及其关联数据"""
     try:
+        await verify_task_ownership(str(task_id), user, db)
         service = TaskService(db)
         await service.delete_task(task_id)
         return ApiResponse(message="任务删除成功")
     except ArgusBaseError:
+        raise
+    except HTTPException:
         raise
     except Exception as e:
         logger.exception("删除任务失败: %s", str(e))
@@ -148,6 +158,7 @@ async def start_task(
 ) -> ApiResponse[TaskResponse]:
     """启动任务：更新状态为 running 并启动后台 Agent 执行"""
     try:
+        await verify_task_ownership(str(task_id), user, db)
         service = TaskService(db)
         task = await service.transition_status(task_id, "running")
 
@@ -171,6 +182,8 @@ async def start_task(
         return ApiResponse(message="任务已启动", data=TaskResponse.model_validate(task))
     except ArgusBaseError:
         raise
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("启动任务失败: %s", str(e))
         raise HTTPException(status_code=500, detail="启动任务时发生内部错误")
@@ -185,6 +198,7 @@ async def pause_task(
 ) -> ApiResponse[TaskResponse]:
     """暂停正在运行的任务"""
     try:
+        await verify_task_ownership(str(task_id), user, db)
         service = TaskService(db)
         task = await service.transition_status(task_id, "paused")
 
@@ -194,6 +208,8 @@ async def pause_task(
 
         return ApiResponse(message="任务已暂停", data=TaskResponse.model_validate(task))
     except ArgusBaseError:
+        raise
+    except HTTPException:
         raise
     except Exception as e:
         logger.exception("暂停任务失败: %s", str(e))
@@ -209,6 +225,7 @@ async def resume_task(
 ) -> ApiResponse[TaskResponse]:
     """恢复已暂停的任务"""
     try:
+        await verify_task_ownership(str(task_id), user, db)
         service = TaskService(db)
         task = await service.transition_status(task_id, "running")
 
@@ -218,6 +235,8 @@ async def resume_task(
 
         return ApiResponse(message="任务已恢复", data=TaskResponse.model_validate(task))
     except ArgusBaseError:
+        raise
+    except HTTPException:
         raise
     except Exception as e:
         logger.exception("恢复任务失败: %s", str(e))
@@ -233,6 +252,7 @@ async def terminate_task(
 ) -> ApiResponse[TaskResponse]:
     """终止任务并停止后台 Agent 执行"""
     try:
+        await verify_task_ownership(str(task_id), user, db)
         service = TaskService(db)
         task = await service.transition_status(task_id, "terminated")
 
@@ -242,6 +262,8 @@ async def terminate_task(
 
         return ApiResponse(message="任务已终止", data=TaskResponse.model_validate(task))
     except ArgusBaseError:
+        raise
+    except HTTPException:
         raise
     except Exception as e:
         logger.exception("终止任务失败: %s", str(e))

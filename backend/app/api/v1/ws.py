@@ -55,12 +55,15 @@ async def task_event_stream(
       {"type": "user_action_ack", "action": "...", "status": "applied"|"rejected",
        "reason": "...", "data": {...}}
     """
-    # Token 验证
-    if token:
-        payload = decode_access_token(token)
-        if payload is None:
-            await websocket.close(code=4001, reason="Token 无效或已过期")
-            return
+    # Token 验证 — WebSocket 连接必须提供有效 token
+    if not token:
+        await websocket.close(code=4001, reason="缺少认证 Token")
+        return
+
+    payload = decode_access_token(token)
+    if payload is None:
+        await websocket.close(code=4001, reason="Token 无效或已过期")
+        return
 
     await websocket.accept()
     logger.info("ws_client_connected", task_id=task_id)

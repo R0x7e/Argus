@@ -45,6 +45,14 @@ RUN /app/venv/bin/python -m playwright install chromium --with-deps
 COPY app/ /app/app/
 COPY alembic/ /app/alembic/
 COPY alembic.ini /app/alembic.ini
+COPY tests/ /app/tests/
+
+# 安装测试依赖
+RUN /app/venv/bin/pip install --no-cache-dir pytest pytest-asyncio
+
+# 创建非 root 用户运行（安全加固）
+RUN useradd -r -s /bin/false -u 1000 appuser && \
+    chown -R appuser:appuser /app
 
 # 设置环境变量
 ENV PATH="/app/venv/bin:$PATH" \
@@ -56,6 +64,8 @@ EXPOSE 8000
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD curl -f http://localhost:8000/api/v1/system/health || exit 1
+
+USER appuser
 
 # 启动命令：使用 uvicorn 运行 FastAPI
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -7,7 +7,7 @@ Agent 执行记录模型
 import uuid
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, String, Text
+from sqlalchemy import DateTime, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -47,12 +47,14 @@ class AgentExecution(UUIDMixin, Base):
 
     # 开始时间
     started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
         nullable=False,
         comment="开始时间",
     )
 
     # 完成时间
     completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
         nullable=True,
         comment="完成时间",
     )

@@ -7,7 +7,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Float, ForeignKey, Index, String, func
+from sqlalchemy import DateTime, Float, ForeignKey, Index, String, func
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -55,6 +55,7 @@ class Event(UUIDMixin, Base):
 
     # 事件时间戳
     timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
         comment="事件时间戳",

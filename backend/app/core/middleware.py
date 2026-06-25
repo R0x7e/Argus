@@ -1,11 +1,12 @@
 """
 中间件模块
 
-提供请求日志记录中间件和全局异常处理器。
+提供请求日志记录中间件、全局异常处理器和速率限制。
 """
 
 import logging
 import time
+from collections import defaultdict
 from typing import Callable
 
 from fastapi import FastAPI, Request
@@ -113,3 +114,45 @@ def register_exception_handlers(app: FastAPI) -> None:
                 "data": None,
             },
         )
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """
+    简单的内存速率限制中间件
+
+    针对认证端点 (登录/注册) 限制请求频率，防止暴力破解。
+    """
+
+    def __init__(self, app: FastAPI, max_requests: int = 10, window_seconds: int = 60):
+        super().__init__(app)
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        # IP -> [(timestamp, ...)]
+        self._requests: dict[str, list[float]] = defaultdict(list)
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        """对 /api/v1/auth/ 路径应用速率限制"""
+        path = request.url.path
+        if path.startswith("/api/v1/auth/") and request.method == "POST":
+            client_ip = request.client.host if request.client else "unknown"
+            now = time.monotonic()
+
+            # 清除过期记录
+            window_start = now - self.window_seconds
+            self._requests[client_ip] = [
+                t for t in self._requests[client_ip] if t > window_start
+            ]
+
+            if len(self._requests[client_ip]) >= self.max_requests:
+                logger.warning(
+                    "速率限制触发: IP=%s, path=%s, count=%d/%d",
+                    client_ip, path, len(self._requests[client_ip]), self.max_requests,
+                )
+                return JSONResponse(
+                    status_code=429,
+                    content={"code": 429, "message": "请求过于频繁，请稍后再试", "data": None},
+                )
+
+            self._requests[client_ip].append(now)
+
+        return await call_next(request)

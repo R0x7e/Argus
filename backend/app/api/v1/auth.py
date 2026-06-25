@@ -7,7 +7,7 @@
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -85,6 +85,7 @@ async def register(
 @router.post("/login", response_model=ApiResponse[TokenResponse], summary="用户登录")
 async def login(
     data: LoginRequest,
+    response: Response,
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[TokenResponse]:
     """
@@ -105,12 +106,23 @@ async def login(
         )
 
     # 更新最后登录时间
-    user.last_login_at = datetime.utcnow()
+    user.last_login_at = datetime.now(timezone.utc)
 
     # 生成 JWT Token
     token = create_access_token(data={"sub": str(user.id), "role": user.role})
 
     logger.info("用户登录: %s", data.username)
+
+    # 设置 httpOnly cookie（防御 XSS 窃取 Token）
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        max_age=settings.JWT_EXPIRE_MINUTES * 60,
+        httponly=True,
+        samesite="lax",
+        secure=False,  # 开发环境 HTTP；生产环境应改为 True
+        path="/",
+    )
 
     return ApiResponse(
         message="登录成功",
@@ -120,6 +132,13 @@ async def login(
             expires_in=settings.JWT_EXPIRE_MINUTES * 60,
         ),
     )
+
+
+@router.post("/logout", summary="登出")
+async def logout(response: Response) -> dict:
+    """清除认证 Cookie 并登出"""
+    response.delete_cookie(key="access_token", path="/")
+    return {"message": "已登出"}
 
 
 @router.get("/me", response_model=ApiResponse[UserResponse], summary="当前用户信息")

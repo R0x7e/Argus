@@ -7,7 +7,7 @@ SQLAlchemy 模型基类
 import uuid
 from datetime import datetime
 
-from sqlalchemy import func, text
+from sqlalchemy import DateTime, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -36,11 +36,13 @@ class UUIDMixin:
     )
 
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
         server_default=func.now(),
         comment="创建时间",
     )
 
     updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
         onupdate=func.now(),
         server_default=func.now(),
         comment="更新时间",

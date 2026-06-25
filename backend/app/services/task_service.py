@@ -5,7 +5,7 @@
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import func, select
@@ -142,12 +142,22 @@ class TaskService:
         await self.db.delete(task)
         await self.db.flush()
 
-    async def transition_status(self, task_id: uuid.UUID, new_status: str) -> Task:
+    async def transition_status(
+        self,
+        task_id: uuid.UUID,
+        new_status: str,
+        error_info: dict | None = None,
+    ) -> Task:
         """
         执行任务状态转换
 
         校验状态转换是否合法，并自动设置 started_at / completed_at 时间戳。
         非法转换将抛出 TaskStateError。
+
+        Args:
+            task_id: 任务 ID
+            new_status: 目标状态
+            error_info: 可选的错误信息，在转入失败状态时写入 task.error_info 字段
         """
         task = await self.get_task(task_id)
         current_status = task.status
@@ -159,7 +169,7 @@ class TaskService:
 
         # 更新状态
         task.status = new_status
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         # 转换到 running 时设置开始时间
         if new_status == "running" and task.started_at is None:
@@ -168,6 +178,10 @@ class TaskService:
         # 转换到终态时设置完成时间
         if new_status in TERMINAL_STATES:
             task.completed_at = now
+
+        # 写入错误信息（如有）
+        if error_info is not None:
+            task.error_info = error_info
 
         await self.db.flush()
         await self.db.refresh(task)

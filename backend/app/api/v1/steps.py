@@ -11,8 +11,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, desc, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import get_current_user
 from app.dependencies import get_db
 from app.models.event import Event
+from app.models.user import User
 from app.schemas.common import ApiResponse
 
 logger = logging.getLogger(__name__)
@@ -30,6 +32,7 @@ async def list_steps(
     node_id: str | None = Query(default=None, description="按搜索树节点 ID 过滤"),
     limit: int = Query(default=50, ge=1, le=200, description="返回条数上限"),
     db: AsyncSession = Depends(get_db),
+    _user: User = Depends(get_current_user),
 ) -> ApiResponse[list[dict]]:
     """查询指定任务的 ReAct 执行步骤（思维链数据）"""
     try:
@@ -67,6 +70,7 @@ async def list_steps(
 async def get_tree(
     task_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    _user: User = Depends(get_current_user),
 ) -> ApiResponse[dict]:
     """返回最新一轮的 MCTS 搜索树快照"""
     try:
