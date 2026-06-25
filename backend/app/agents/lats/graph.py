@@ -885,6 +885,15 @@ async def _sync_discoveries_to_knowledge(
                     endpoint=data.get("endpoint", ""),
                 )
             elif d.discovery_type == DiscoveryType.WAF_BYPASS_FOUND:
+                # v16: 完整记录 WAF 规则 (filtered/allowed chars + bypass technique)
+                filter_data = data.get("filter_rules", {})
+                if isinstance(filter_data, dict):
+                    blocked = filter_data.get("blocked", [])
+                    allowed = filter_data.get("allowed", [])
+                    for ch in (blocked if isinstance(blocked, list) else []):
+                        await knowledge.record_waf_rule(filtered_char=str(ch)[:1])
+                    for ch in (allowed if isinstance(allowed, list) else []):
+                        await knowledge.record_waf_rule(allowed_char=str(ch)[:1])
                 await knowledge.record_waf_rule(
                     bypass_technique={"technique": str(data.get("filter_rules", ""))[:100]},
                 )
@@ -894,16 +903,29 @@ async def _sync_discoveries_to_knowledge(
                     source=data.get("evidence", "react"),
                 )
             elif d.discovery_type == DiscoveryType.ERROR_LEAK:
+                # v16: 从 source_node 获取 endpoint (discovery.data 中无此字段)
+                src_node = tree.get_node(d.source_node_id)
+                ep = src_node.state.current_endpoint if src_node else data.get("endpoint", "")
+                param = src_node.state.current_param if src_node else data.get("param", "")
                 await knowledge.record_vuln_signal(
-                    endpoint=data.get("endpoint", ""),
-                    param=data.get("param", ""),
-                    vuln_type="sql_injection",
-                    signal_type="error_leaked",
-                    confidence=0.6,
-                    evidence=data.get("observation", ""),
+                    endpoint=ep, param=param or "",
+                    vuln_type="sql_injection", signal_type="error_leaked",
+                    confidence=0.6, evidence=data.get("observation", ""),
                 )
-        except Exception:
-            pass
+            elif d.discovery_type == DiscoveryType.VULN_TYPE_CLUE:
+                # v16: VULN_TYPE_CLUE → 记录漏洞信号
+                src_node = tree.get_node(d.source_node_id)
+                ep = src_node.state.current_endpoint if src_node else data.get("endpoint", "")
+                param = src_node.state.current_param if src_node else data.get("param", "")
+                await knowledge.record_vuln_signal(
+                    endpoint=ep, param=param or "",
+                    vuln_type=src_node.state.vuln_type if src_node else "unknown",
+                    signal_type="reflected" if "reflected" in str(data).lower() else "vuln_clue",
+                    confidence=d.confidence, evidence=str(data.get("observation", data))[:200],
+                )
+        except Exception as e:
+            logger.warning("knowledge sync failed for %s: %s",
+                          d.discovery_type.value if d.discovery_type else "?", str(e)[:100])
 
     # 从 ReAct 结果中记录探索历史
     for result in react_results:

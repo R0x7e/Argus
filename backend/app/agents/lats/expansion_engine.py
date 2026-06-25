@@ -233,22 +233,28 @@ class DiscoveryExtractor:
             if not isinstance(fact, str):
                 continue
             fact_lower = fact.lower()
-            if any(kw in fact_lower for kw in ("发现", "found", "端点", "endpoint", "链接", "link", "url", "api")):
-                discoveries.append(Discovery(
-                    discovery_type=DiscoveryType.NEW_ENDPOINT,
-                    source_node_id=node.id,
-                    source_cycle=cycle,
-                    data={"url": fact[:200], "source": "new_facts"},
-                    confidence=0.4,
-                ))
+            # v16: 扩展关键词覆盖 — URL/端点/参数/漏洞信号/技术栈/WAF
+            if any(kw in fact_lower for kw in ("发现", "found", "端点", "endpoint", "链接", "link", "url", "api", "路径", "path")):
+                discoveries.append(Discovery(discovery_type=DiscoveryType.NEW_ENDPOINT,
+                    source_node_id=node.id, source_cycle=cycle,
+                    data={"url": fact[:200], "source": "new_facts"}, confidence=0.4))
             if any(kw in fact_lower for kw in ("参数", "param", "注入点", "injection")):
-                discoveries.append(Discovery(
-                    discovery_type=DiscoveryType.NEW_PARAM,
-                    source_node_id=node.id,
-                    source_cycle=cycle,
-                    data={"param_name": fact[:200], "endpoint": node.state.current_endpoint},
-                    confidence=0.4,
-                ))
+                discoveries.append(Discovery(discovery_type=DiscoveryType.NEW_PARAM,
+                    source_node_id=node.id, source_cycle=cycle,
+                    data={"param_name": fact[:200], "endpoint": node.state.current_endpoint}, confidence=0.4))
+            # v16: 漏洞信号/技术栈/WAF 检测
+            if any(kw in fact_lower for kw in ("反射", "reflected", "payload", "确认", "confirmed")):
+                discoveries.append(Discovery(discovery_type=DiscoveryType.VULN_TYPE_CLUE,
+                    source_node_id=node.id, source_cycle=cycle,
+                    data={"observation": fact[:200], "source": "new_facts"}, confidence=0.55))
+            if any(kw in fact_lower for kw in ("server:", "x-powered-by", "framework:", "技术栈", "apache", "nginx", "php", "mysql")):
+                discoveries.append(Discovery(discovery_type=DiscoveryType.TECH_DISCOVERY,
+                    source_node_id=node.id, source_cycle=cycle,
+                    data={"tech_name": fact[:100], "evidence": fact[:200]}, confidence=0.5))
+            if any(kw in fact_lower for kw in ("waf", "过滤", "blocked", "allowed", "filter", "绕过", "bypass")):
+                discoveries.append(Discovery(discovery_type=DiscoveryType.WAF_BYPASS_FOUND,
+                    source_node_id=node.id, source_cycle=cycle,
+                    data={"observation": fact[:200], "action": "from_new_facts"}, confidence=0.5))
 
         # 7. v2-fix: run_poc 结果特殊处理
         for step in getattr(result, 'steps', []):
