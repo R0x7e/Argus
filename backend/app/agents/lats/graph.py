@@ -300,6 +300,7 @@ async def lats_init_tree_node(state: dict) -> dict:
     """初始化搜索树 — 将攻击面转换为初始分支 (v2: 标记为 SEED)"""
     bb = state["blackboard"]
     task_id = state["task_id"]
+    task_config = state.get("task_config", {}) or {}  # v18-fix
     attack_surface = bb.attack_surface or {}
     target_url = bb.target_profile.get("base_url", "")
     tech_stack = bb.target_profile.get("tech_stack", [])
