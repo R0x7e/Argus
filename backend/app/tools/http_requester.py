@@ -75,7 +75,7 @@ class HTTPRequesterTool(BaseTool):
                 success: bool,
                 status_code: int,
                 headers: dict,
-                body: str,           # 响应体（截断至 5000 字符）
+                body: str,           # 响应体（截断至 50000 字符）
                 response_time_ms: int,
                 redirect_history: list,
             }
@@ -133,12 +133,13 @@ class HTTPRequesterTool(BaseTool):
             # 提取响应头（转为普通字典）
             response_headers = dict(response.headers)
 
-            # 响应体截断处理（限制 5000 字符，避免大响应占用过多资源）
+            # 响应体截断处理（提高到 50000 字符，保留足够内容用于漏洞检测）
+            original_body_length = len(response.text)
             body_text = response.text
-            body_truncated = len(body_text) > 5000
+            body_truncated = original_body_length > 50000
             if body_truncated:
-                body_text = body_text[:5000] + "\n...[响应体已截断，原始长度: {}]".format(
-                    len(response.text)
+                body_text = body_text[:50000] + "\n...[响应体已截断，原始长度: {}]".format(
+                    original_body_length
                 )
 
             return {
@@ -147,6 +148,7 @@ class HTTPRequesterTool(BaseTool):
                 "headers": response_headers,
                 "body": body_text,
                 "body_truncated": body_truncated,
+                "original_body_length": original_body_length,
                 "response_time_ms": elapsed_ms,
                 "redirect_history": redirect_history,
                 "url": str(response.url),

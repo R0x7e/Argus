@@ -470,16 +470,18 @@ class ExpansionEngine:
         self.discovery_extractor = DiscoveryExtractor()
         self._expansion_history: list[dict] = []
 
-    def expand(
+    async def expand(
         self,
         tree: SearchTree,
         discoveries: list[Discovery],
         current_cycle: int,
         base_url: str = "",
         knowledge: Any = None,  # Phase 2: SharedKnowledge
+        llm: Any = None,  # P2-3: LLM 客户端, 用于 LLM 辅助扩展
+        task_id: str = "",  # P2-3: 任务 ID
     ) -> dict:
         """
-        基于发现执行动态扩展
+        基于发现执行动态扩展 (P2-3: 增加 LLM 辅助扩展)
 
         Args:
             tree: 搜索树
@@ -487,6 +489,8 @@ class ExpansionEngine:
             current_cycle: 当前周期
             base_url: 目标基础 URL
             knowledge: SharedKnowledge 引用 (Phase 2)
+            llm: LLM 客户端 (P2-3: 用于生成扩展方向)
+            task_id: 任务 ID
 
         Returns:
             {
@@ -522,6 +526,15 @@ class ExpansionEngine:
                 type_key = discovery.discovery_type.value
                 by_type[type_key] = by_type.get(type_key, 0) + len(created_nodes)
 
+        # P2-3: LLM 辅助扩展 — 利用 LLM 推理生成额外扩展方向
+        if llm is not None and discoveries:
+            llm_branches = await self._expand_with_llm(
+                tree, discoveries, current_cycle, base_url, llm, task_id,
+            )
+            if llm_branches:
+                new_branches += llm_branches
+                by_type["llm_suggestion"] = by_type.get("llm_suggestion", 0) + llm_branches
+
         # Graveyard 复活检查
         resurrected = 0
         if knowledge is not None and hasattr(knowledge, 'get_recent_changes'):
@@ -552,6 +565,120 @@ class ExpansionEngine:
             "discoveries_processed": len(discoveries),
             "by_type": by_type,
         }
+
+    async def _expand_with_llm(
+        self,
+        tree: SearchTree,
+        discoveries: list[Discovery],
+        current_cycle: int,
+        base_url: str,
+        llm: Any,
+        task_id: str = "",
+    ) -> int:
+        """P2-3: 使用 LLM 生成扩展方向"""
+        try:
+            import json as _json
+            from .prompts import EXPAND_PROMPT_TEMPLATE
+
+            root = tree.get_root()
+            if root is None:
+                return 0
+
+            # 构建上下文: 收集最近的发现摘要
+            discovery_summaries = []
+            for d in discoveries[:10]:
+                discovery_summaries.append(f"{d.discovery_type.value}: {str(d.data)[:100]}")
+
+            # 选择一个代表性节点作为上下文
+            recent_nodes = [n for n in tree.nodes.values() if n.visit_count > 0][-3:]
+            if not recent_nodes:
+                return 0
+
+            node = recent_nodes[-1]
+            node_state = {
+                "target_url": base_url or node.state.target_url,
+                "current_endpoint": node.state.current_endpoint,
+                "current_param": node.state.current_param or "N/A",
+                "vuln_type": node.state.vuln_type,
+                "known_facts": node.state.known_facts[-5:],
+                "tried_actions": node.state.tried_actions[-5:],
+            }
+            last_obs = node.state.reasoning_chain[-1].observation if node.state.reasoning_chain else ""
+
+            prompt = EXPAND_PROMPT_TEMPLATE.format(
+                target_url=node_state["target_url"],
+                endpoint=node_state["current_endpoint"],
+                param=node_state["current_param"],
+                vuln_type=node_state["vuln_type"],
+                known_facts=node_state["known_facts"],
+                tried_actions=node_state["tried_actions"],
+                last_observation=last_obs or "无",
+            )
+
+            messages = [
+                {"role": "system", "content": "你是漏洞搜索树的扩展器。生成具体的、可执行的下一步动作方向。"},
+                {"role": "user", "content": prompt},
+            ]
+
+            response_text = await llm.call(
+                agent="expand", messages=messages, task_id=task_id,
+            )
+
+            # 解析 LLM 响应为 JSON 数组
+            try:
+                start = response_text.find("[")
+                end = response_text.rfind("]") + 1
+                if start < 0 or end <= start:
+                    return 0
+                suggestions = _json.loads(response_text[start:end])
+            except _json.JSONDecodeError:
+                logger.warning("LLM 扩展响应解析失败")
+                return 0
+
+            if not isinstance(suggestions, list):
+                return 0
+
+            created_count = 0
+            for suggestion in suggestions[:3]:
+                if not isinstance(suggestion, dict):
+                    continue
+                if not self.quotas.can_create(
+                    DiscoveryType.LLM_SUGGESTION, tree,
+                    extra={"cycle": current_cycle},
+                ):
+                    break
+
+                action = suggestion.get("action", "explore")
+                params = suggestion.get("params", {})
+                value = float(suggestion.get("estimated_value", 0.4))
+                value = max(0.1, min(1.0, value))
+
+                # 从建议中提取端点/参数/漏洞类型
+                ep = params.get("endpoint", node.state.current_endpoint)
+                param = params.get("param", node.state.current_param)
+                vt = params.get("vuln_type", node.state.vuln_type)
+
+                child = tree.create_child_node(
+                    parent=node,
+                    action=action,
+                    action_params=params,
+                    vuln_type=vt,
+                    endpoint=ep,
+                    param=param,
+                    value_estimate=value,
+                    created_at_cycle=current_cycle,
+                )
+                child.status = NodeStatus.SEED
+                created_count += 1
+                self.quotas.record_creation(DiscoveryType.LLM_SUGGESTION)
+
+            if created_count:
+                logger.info("LLM 扩展: 生成了 %d 个新分支", created_count)
+            return created_count
+
+        except Exception as e:
+            logger.warning("LLM 扩展失败 (非致命): %s", str(e))
+            return 0
 
     def _create_branches_for_discovery(
         self,

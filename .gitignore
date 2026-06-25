@@ -75,6 +75,7 @@ playwright/.cache/
 # === IDE & 编辑器 ===
 .idea/
 .vscode/
+.qoder/
 .claude/settings.local.json
 *.swp
 *.swo

@@ -489,6 +489,9 @@ async def lats_init_tree_node(state: dict) -> dict:
                 "page": ["lfi", "path_traversal"],
             }
             for vt in fb_vuln_map.get(fb_param, ["sql_injection"])[:2]:
+                # P1-2: 如果有 focus_vuln_types, 不为不相关的 vuln_type 创建分支
+                if focus_vuln_types and vt not in focus_vuln_types:
+                    continue
                 bk = f"{vt}@{path}:{fb_param}"
                 if bk in seen_branches:
                     continue
@@ -569,6 +572,7 @@ async def lats_mcts_select_node(state: dict) -> dict:
     """MCTS 选择 (v2: 自适应多因素选择 + cold start)"""
     tree: SearchTree = state["search_tree"]
     task_id = state["task_id"]
+    bb = state.get("blackboard", None)  # P1-1: 获取 blackboard 以访问 shared_knowledge
     pool = _get_executor_pool()
     cycle = state.get("current_cycle", 0)
 
@@ -586,6 +590,7 @@ async def lats_mcts_select_node(state: dict) -> dict:
         batch_size=batch_size,
         current_cycle=cycle,
         cold_start_until_cycle=2,
+        knowledge=bb.shared_knowledge if hasattr(bb, 'shared_knowledge') and bb.shared_knowledge else None,  # P1-1: 传入 knowledge
     )
 
     selected_info = []
@@ -879,13 +884,16 @@ async def lats_expand_node(state: dict) -> dict:
     # 2. 写入 SharedKnowledge (从 ReAct 结果 + 发现)
     await _sync_discoveries_to_knowledge(knowledge, unique_discoveries, react_results, tree)
 
-    # 3. 执行扩展 (传入 knowledge 以启用 Graveyard 复活)
-    expansion_result = engine.expand(
+    # 3. 执行扩展 (P2-3: 传入 knowledge + llm 以启用 LLM 辅助扩展)
+    llm = _get_llm_client(task_id)
+    expansion_result = await engine.expand(
         tree=tree,
         discoveries=unique_discoveries,
         current_cycle=cycle,
         base_url=target_url,
         knowledge=knowledge,
+        llm=llm,
+        task_id=task_id,
     )
 
     tree_stats = tree.stats()
@@ -899,24 +907,8 @@ async def lats_expand_node(state: dict) -> dict:
 
     await emit(task_id, "lats_expand", "agent_stopped", {"node": "expand"})
 
-    # v18-fix: engine.expand 异常保护 (修复 v13 缩进语法错误)
-    try:
-        expansion_result = engine.expand(
-            tree=tree, discoveries=unique_discoveries,
-            current_cycle=cycle, base_url=target_url, knowledge=knowledge,
-        )
-    except Exception as e:
-        logger.error("engine.expand failed (non-fatal): %s", str(e))
-        expansion_result = {"error": str(e)[:200], "new_branches": 0, "resurrected": 0, "by_type": {}}
-
-    tree_stats = tree.stats()
-
-    await emit(task_id, "lats_expand", "expansion_complete", {
-        **expansion_result,
-        "tree_stats": tree_stats,
-        "graveyard": tree.get_graveyard_stats(),
-        "knowledge_summary": knowledge.get_summary() if knowledge else {},
-    })
+    # P1-3: 删除重复的 engine.expand() 调用 (原 L907-L924)
+    # 原代码在此处重复调用 engine.expand(), 导致重复创建分支和重复事件
 
     return {
         "search_tree": tree,

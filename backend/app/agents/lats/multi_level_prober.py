@@ -292,7 +292,7 @@ class QuickProber:
                     resp = await client.get(url)
 
                 elapsed_ms = int((time.monotonic() - start) * 1000)
-                body = resp.text[:3000] if resp.text else ""
+                body = resp.text[:50000] if resp.text else ""  # P2-5: 从 3000 提高到 50000
 
                 return {
                     "success": True,

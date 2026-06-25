@@ -27,6 +27,7 @@ class ActionType(str, Enum):
     BATCH_INJECT = "batch_inject"       # v7: 批量注入
     MUTATE_PAYLOAD = "mutate_payload"
     PROBE_FILTER = "probe_filter"
+    SQLI_DETECT = "sqli_detect"         # P0-4: 专用 SQL 注入检测
 
     # 认证类
     TEST_NO_AUTH = "test_no_auth"
@@ -130,6 +131,8 @@ async def execute_action(
             return await _execute_mutate(params, context, tool_registry)
         elif action == ActionType.PROBE_FILTER:
             return await _execute_probe_filter(params, context, tool_registry)
+        elif action == ActionType.SQLI_DETECT:
+            return await _execute_sqli_detect(params, context, tool_registry, state)
         elif action == ActionType.CRAWL_PAGE:
             return await _execute_crawl(params, context, tool_registry)
         elif action == ActionType.DISCOVER_PARAMS:
@@ -164,11 +167,14 @@ async def execute_action(
 
 
 async def _execute_inject(params: dict, context: ExecutionContext, registry, state: Any = None) -> Observation:
-    """注入 payload 并分析响应 (v5: state 参数用于 _detect_vuln_indicators)"""
+    """注入 payload 并分析响应 (P0-3: 自动基线比较, 检测布尔型盲注)"""
     url = params.get("url", "")
     param = params.get("param", "")
     payload = params.get("payload", "")
     method = params.get("method", "GET")
+    # P0-3: 可选自定义基线值, 默认 "1"
+    baseline_value = params.get("baseline_value", "1")
+    skip_baseline = params.get("skip_baseline", False)
 
     # v3-fix: 无参端点回退 — 直接在 URL 路径追加 payload 或使用 dummy 参数
     if not param and not payload:
@@ -196,6 +202,50 @@ async def _execute_inject(params: dict, context: ExecutionContext, registry, sta
     status = result.get("status_code", 0)
     headers = result.get("headers", {})
     time_ms = result.get("response_time_ms", 0)
+    orig_len = result.get("original_body_length", len(body))
+
+    # P0-3: 自动基线比较 — 有参数时自动发送基线请求
+    baseline_diff_info = ""
+    if param and payload and not skip_baseline:
+        try:
+            bl_req = _build_inject_url(url, param, baseline_value, method)
+            bl_result = await tool.execute(bl_req, context)
+            if bl_result.get("success"):
+                bl_body = bl_result.get("body", "") or ""
+                bl_status = bl_result.get("status_code", 0)
+                bl_time = bl_result.get("response_time_ms", 0)
+                bl_orig_len = bl_result.get("original_body_length", len(bl_body))
+
+                # 使用原始长度比较 (避免截断归一化)
+                len_diff = orig_len - bl_orig_len
+                status_diff = status != bl_status
+                time_diff = time_ms - bl_time
+
+                if status_diff or abs(len_diff) > 10 or abs(time_diff) > 1000:
+                    obs_baseline_diff = True
+                    parts = []
+                    if status_diff:
+                        parts.append(f"status {bl_status}→{status}")
+                    if abs(len_diff) > 10:
+                        parts.append(f"len_diff {len_diff}")
+                    if abs(time_diff) > 1000:
+                        parts.append(f"time_diff {time_diff}ms")
+                    baseline_diff_info = f" | BASELINE_DIFF: {', '.join(parts)}"
+                    # 内容指纹比较
+                    if bl_body != body:
+                        import re as _re_bl
+                        bl_fp = _re_bl.sub(r'\d+', '', bl_body)
+                        r_fp = _re_bl.sub(r'\d+', '', body)
+                        if bl_fp != r_fp:
+                            baseline_diff_info += " (content differs)"
+                else:
+                    obs_baseline_diff = False
+            else:
+                obs_baseline_diff = False
+        except Exception:
+            obs_baseline_diff = False
+    else:
+        obs_baseline_diff = False
 
     obs = Observation(
         success=True,
@@ -203,7 +253,7 @@ async def _execute_inject(params: dict, context: ExecutionContext, registry, sta
         response_body=body[:2000],
         response_headers=headers,
         response_time_ms=time_ms,
-        tool_call={"tool": "http_request", "params": req_params, "result": {"status_code": status, "body_len": len(body)}},
+        tool_call={"tool": "http_request", "params": req_params, "result": {"status_code": status, "body_len": orig_len, "orig_body_len": orig_len}},
     )
 
     # 分析响应异常
@@ -211,6 +261,14 @@ async def _execute_inject(params: dict, context: ExecutionContext, registry, sta
     obs.response_time_anomaly = time_ms > 3000
     obs.endpoint_404 = status == 404
     obs.waf_blocked = status == 403 or _is_waf_response(body)
+
+    # P0-3: 基线差异是重要信息
+    if obs_baseline_diff:
+        obs.new_info_gained = True
+        obs.new_facts.append(f"基线差异: payload='{payload[:40]}' vs baseline='{baseline_value}'{baseline_diff_info}")
+        obs.same_as_baseline = False
+    else:
+        obs.same_as_baseline = True
 
     # 检测错误信息泄露
     error_patterns = [
@@ -233,11 +291,13 @@ async def _execute_inject(params: dict, context: ExecutionContext, registry, sta
 
     obs.summary = (
         f"status={status}, time={time_ms}ms, "
-        f"body_len={len(body)}, "
+        f"body_len={orig_len}, "
         f"{'REFLECTED' if payload in body else ''} "
         f"{'ERROR_LEAKED' if obs.error_message_leaked else ''} "
         f"{'WAF_BLOCKED' if obs.waf_blocked else ''} "
+        f"{'SAME_AS_BASELINE' if obs.same_as_baseline else 'DIFF_FROM_BASELINE'} "
         f"{'VULN_CONFIRMED' if obs.vuln_confirmed else ''}"
+        f"{baseline_diff_info}"
     ).strip()
 
     return obs
@@ -375,18 +435,18 @@ async def _execute_batch_inject(params: dict, context: ExecutionContext, registr
         entry = {"payload": str(payload)[:80], "status": r_status, "len": r_len, "time_ms": r_time,
                  "body_preview": r_body[:150].replace('\n','\\n').replace('\r','')}
         results.append(entry)
-        # 异常检测
+        # 异常检测 (P0-2: 独立 if 检查, 不再用 elif 链)
         if r_status != bl_status and r_status not in (404, 403):
             anomalies.append(f"status {bl_status}→{r_status}: {payload[:40]}")
-        elif abs(r_len - bl_len) > 50:  # v10: 阈值 100→50, 更敏感
+        if abs(r_len - bl_len) > 50:  # 长度差异
             anomalies.append(f"len diff {r_len - bl_len}: {payload[:40]}")
-        elif r_time - bl_time > 1500:  # v10: 阈值 2000→1500ms
+        if r_time - bl_time > 1500:  # 时间差异
             anomalies.append(f"time +{r_time - bl_time}ms: {payload[:40]}")
-        # v10: 内容指纹 — 去数字后对比
-        elif r_len == bl_len and r_body != baseline_body:
+        # 内容指纹 — 去数字后对比完整 body (P0-2: 去掉 [:500] 限制)
+        if r_body != baseline_body:
             import re as _re4
-            bl_fp = _re4.sub(r'\d+', '', baseline_body[:500])
-            r_fp = _re4.sub(r'\d+', '', r_body[:500])
+            bl_fp = _re4.sub(r'\d+', '', baseline_body)
+            r_fp = _re4.sub(r'\d+', '', r_body)
             if bl_fp != r_fp:
                 anomalies.append(f"content fingerprint diff: {payload[:40]}")
 
@@ -426,9 +486,9 @@ async def _execute_mutate(params: dict, context: ExecutionContext, registry) -> 
         return Observation(success=False, summary="mutate_payload 缺少 original 参数")
 
     tool = registry.get("payload_mutate")
-    result = await tool.execute({"payload": original, "mutations": [technique]}, context)
+    result = await tool.execute({"payload": original, "techniques": [technique]}, context)
 
-    mutated_list = result.get("mutated_payloads", [])
+    mutated_list = result.get("variants", [])
     if mutated_list:
         mutated = mutated_list[0] if isinstance(mutated_list[0], str) else str(mutated_list[0])
     else:
@@ -489,6 +549,77 @@ async def _execute_probe_filter(params: dict, context: ExecutionContext, registr
         filter_rules={"blocked": blocked, "allowed": allowed},
         tool_call={"tool": "http_request", "params": {"probe_filter": True}, "result": {"blocked": blocked, "allowed": allowed}},
     )
+
+
+async def _execute_sqli_detect(params: dict, context: ExecutionContext, registry, state: Any = None) -> Observation:
+    """P0-4: 调用专用 SQL 注入检测工具 (错误型 + 时间盲注)"""
+    url = params.get("url", "")
+    param = params.get("param", "")
+    method = params.get("method", "GET")
+
+    if not url or not param:
+        return Observation(success=False, summary="sqli_detect 缺少 url/param")
+
+    # 从 URL 中剥离 query string (sqli_detect 工具自己构造参数)
+    from urllib.parse import urlparse as _urlparse
+    parsed = _urlparse(url)
+    clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    # 如果 URL 中已有 query 参数, 尝试提取参数名
+    if not param and parsed.query:
+        from urllib.parse import parse_qs
+        qs = parse_qs(parsed.query)
+        if qs:
+            param = list(qs.keys())[0]
+
+    if not param:
+        return Observation(success=False, summary="sqli_detect 缺少 param 参数")
+
+    tool = registry.get("sqli_detect")
+    if tool is None:
+        return Observation(success=False, summary="sqli_detect 工具未注册")
+
+    result = await tool.execute({
+        "url": clean_url,
+        "param": param,
+        "method": method,
+    }, context)
+
+    if not result.get("success"):
+        return Observation(
+            success=False,
+            summary=f"sqli_detect 失败: {result.get('error', 'unknown')}",
+            tool_call={"tool": "sqli_detect", "params": {"url": clean_url, "param": param}, "result": result},
+        )
+
+    vulnerable = result.get("vulnerable", False)
+    technique = result.get("technique", "")
+    evidence = result.get("evidence", {})
+    payload_used = result.get("payload_used", "")
+
+    obs = Observation(
+        success=True,
+        summary=f"sqli_detect: {'VULNERABLE' if vulnerable else 'not vulnerable'} (technique={technique}, payload={payload_used[:50]})",
+        tool_call={"tool": "sqli_detect", "params": {"url": clean_url, "param": param}, "result": result},
+    )
+
+    if vulnerable:
+        obs.vuln_confirmed = True
+        obs.severity = "high"
+        obs.finding = {
+            "type": "sql_injection",
+            "evidence": f"sqli_detect 确认: technique={technique}",
+            "payload": payload_used,
+            "url": clean_url,
+            "param": param,
+            "detection_method": technique,
+            "raw_evidence": evidence,
+        }
+        obs.new_facts.append(f"SQLi 确认 (sqli_detect): {technique}, payload={payload_used[:50]}")
+    else:
+        obs.new_facts.append(f"sqli_detect 未发现 SQL 注入 (technique={technique})")
+        obs.new_info_gained = True
+
+    return obs
 
 
 async def _execute_crawl(params: dict, context: ExecutionContext, registry) -> Observation:

@@ -302,6 +302,55 @@ async def _run_reconnaissance(state: VulnHuntState) -> dict:
             unique_params.append(p)
     recon_results["parameters"] = unique_params[:100]
 
+    # P2-1: deep_crawl (crawlergo) 深度爬取 — 自动触发 JS 事件和填充表单
+    try:
+        from app.tools import tool_registry
+        deep_crawl_tool = tool_registry.get("deep_crawl")
+        if deep_crawl_tool:
+            dc_result = await deep_crawl_tool.execute({
+                "url": target_url,
+                "max_count": 500,
+                "timeout": 60,
+            }, context)
+            if dc_result.get("success"):
+                dc_urls = dc_result.get("urls", []) or []
+                dc_forms = dc_result.get("forms", []) or []
+                dc_params = dc_result.get("parameters", []) or []
+                # 合并 deep_crawl 发现的 URL
+                for u in dc_urls[:50]:
+                    if isinstance(u, dict):
+                        url_str = u.get("url", "")
+                    elif isinstance(u, str):
+                        url_str = u
+                    else:
+                        url_str = ""
+                    if url_str and url_str not in all_links:
+                        all_links.append(url_str)
+                # 合并表单
+                for fm in dc_forms[:20]:
+                    if isinstance(fm, dict) and fm not in recon_results["forms"]:
+                        recon_results["forms"].append(fm)
+                # 合并参数
+                for p in dc_params[:20]:
+                    if isinstance(p, dict):
+                        pname = p.get("name", "")
+                    elif isinstance(p, str):
+                        pname = p
+                    else:
+                        pname = ""
+                    if pname:
+                        p_entry = {"name": pname, "type": "deep_crawl", "source": "crawlergo"}
+                        key = f":{pname}"
+                        if key not in seen_params:
+                            seen_params.add(key)
+                            unique_params.append(p_entry)
+                recon_results["tools_run"].append("deep_crawl")
+                logger.info("deep_crawl: %d URLs, %d forms, %d params",
+                            len(dc_urls), len(dc_forms), len(dc_params))
+    except Exception as e:
+        logger.warning("deep_crawl 执行失败: %s", str(e))
+    recon_results["parameters"] = unique_params[:100]
+
     # 更新 homepage_info 中的 links 为完整集合
     recon_results["homepage_info"]["all_discovered_links"] = all_links[:100]
 

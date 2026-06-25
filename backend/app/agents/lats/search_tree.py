@@ -267,7 +267,7 @@ class SearchTree:
                 candidates.append(node)
         return candidates
 
-    def select_batch(self, batch_size: int = 4, exploration_weight: float = 1.414, current_cycle: int = 0, cold_start_until_cycle: int = 1) -> list[SearchNode]:
+    def select_batch(self, batch_size: int = 4, exploration_weight: float = 1.414, current_cycle: int = 0, cold_start_until_cycle: int = 1, knowledge: Any = None) -> list[SearchNode]:
         candidates = self._collect_candidates()
         if not candidates:
             return []
@@ -291,8 +291,8 @@ class SearchTree:
             if selected:
                 self._record_selections(selected)
                 return selected
-        # Normal: adaptive scoring + diversity filter
-        scored = [(n, self._adaptive_selection_score(n, self.nodes.get(n.parent_id) if n.parent_id else n)) for n in candidates]
+        # Normal: adaptive scoring + diversity filter (P1-1: 传入 knowledge 参数)
+        scored = [(n, self._adaptive_selection_score(n, self.nodes.get(n.parent_id) if n.parent_id else n, knowledge)) for n in candidates]
         scored.sort(key=lambda x: x[1], reverse=True)
         selected = []
         for node, score in scored:

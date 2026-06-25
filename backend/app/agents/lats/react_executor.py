@@ -33,6 +33,9 @@ class ReactResult:
     reward: float = 0.0
     finding: dict = field(default_factory=dict)
     error: str = ""
+    # P0-5: 增加 tool_results 和 new_facts 字段, 传递给 expand 节点
+    tool_results: list[dict] = field(default_factory=list)
+    new_facts: list[str] = field(default_factory=list)
 
 
 def _parse_react_response(response_text: str) -> dict:
@@ -70,14 +73,53 @@ async def _maybe_record_to_knowledge(
     node,  # SearchNode
     step_idx: int,
 ) -> None:
-    """v2: 从 Observation 中提取知识并写入 SharedKnowledge (非阻塞)"""
+    """P2-4: 从 Observation 中提取知识并写入节点状态 (供 expand 节点使用)"""
     try:
-        import asyncio as _asyncio
-        # 通过 agent_runner 的全局引用获取 knowledge (非阻塞方式)
-        # 实际的知识库实例存储在 Blackboard 中, 由 graph.py 节点管理
+        # 1. 提取有效参数信息
+        if observation.success and observation.tool_call:
+            tool_name = observation.tool_call.get("tool", "")
+            tool_result = observation.tool_call.get("result", {})
+            if tool_name == "http_request" and isinstance(tool_result, dict):
+                if observation.new_info_gained and not observation.same_as_baseline:
+                    param = action_params.get("param", "")
+                    if param and hasattr(node, 'state'):
+                        if not hasattr(node.state, '_effective_params'):
+                            node.state._effective_params = set()
+                        node.state._effective_params.add(param)
+
+        # 2. 提取 WAF/过滤规则
+        if observation.filter_rules:
+            blocked = observation.filter_rules.get("blocked", [])
+            allowed = observation.filter_rules.get("allowed", [])
+            if (blocked or allowed) and hasattr(node, 'state'):
+                if not hasattr(node.state, '_waf_rules'):
+                    node.state._waf_rules = {}
+                node.state._waf_rules["blocked"] = blocked
+                node.state._waf_rules["allowed"] = allowed
+
+        # 3. 提取错误信息泄露
+        if observation.error_message_leaked and hasattr(node, 'state'):
+            if not hasattr(node.state, '_error_leaks'):
+                node.state._error_leaks = []
+            node.state._error_leaks.append({
+                "step": step_idx,
+                "action": action_str,
+                "params": action_params,
+                "observation": observation.summary[:200],
+            })
+
+        # 4. 提取漏洞信号 (非确认但可疑)
+        if observation.new_facts:
+            for fact in observation.new_facts:
+                fact_lower = fact.lower() if isinstance(fact, str) else ""
+                if any(kw in fact_lower for kw in ("反射", "reflected", "错误", "error", "延迟", "delay", "差异", "diff")):
+                    if hasattr(node, 'state'):
+                        if not hasattr(node.state, '_vuln_signals'):
+                            node.state._vuln_signals = []
+                        node.state._vuln_signals.append(fact[:200])
+
     except Exception:
-        pass
-    # 此函数作为钩子占位，实际写入在 expand_node 中批量完成
+        pass  # 知识记录失败不影响核心流程
 
 async def react_agent_loop(
     node: SearchNode,
@@ -101,6 +143,9 @@ async def react_agent_loop(
     accumulated_reward = 0.0
     consecutive_no_info = 0
     consecutive_tool_errors = 0  # v17: 连续工具异常计数
+    # P0-5: 收集 tool_results 和 new_facts 传递给 expand 节点
+    all_tool_results: list[dict] = []
+    all_new_facts: list[str] = []
 
     for step_idx in range(max_steps):
         # === Thought: 调用 LLM 决定下一步 ===
@@ -260,6 +305,11 @@ async def react_agent_loop(
                 result=observation.tool_call.get("result", {}),
                 success=observation.success,
             ))
+            # P0-5: 收集 tool_results
+            all_tool_results.append(observation.tool_call)
+        # P0-5: 收集 new_facts
+        if observation.new_facts:
+            all_new_facts.extend(observation.new_facts)
 
         steps.append(ThoughtStep(
             thought=thought,
@@ -297,6 +347,8 @@ async def react_agent_loop(
                 steps=steps,
                 reward=1.0,
                 finding=observation.finding,
+                tool_results=all_tool_results,
+                new_facts=all_new_facts,
             )
 
         # === v17: 跟踪连续无信息步 ===
@@ -318,6 +370,8 @@ async def react_agent_loop(
                 status="backtrack",
                 steps=steps,
                 reward=accumulated_reward,
+                tool_results=all_tool_results,
+                new_facts=all_new_facts,
             )
 
     # 步数耗尽
@@ -326,6 +380,8 @@ async def react_agent_loop(
         status="step_limit",
         steps=steps,
         reward=accumulated_reward,
+        tool_results=all_tool_results,
+        new_facts=all_new_facts,
     )
 
 

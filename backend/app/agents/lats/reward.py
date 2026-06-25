@@ -61,11 +61,11 @@ def compute_reward(observation: Observation) -> float:
     if not observation.success:
         reward -= 0.15
 
-    # 没有任何新信息的步骤给微负奖励
+    # 没有任何新信息的步骤给更强负奖励 (P1-4: 从 -0.03 提高到 -0.12)
     if not observation.new_info_gained and not observation.vuln_confirmed and observation.success:
-        reward -= 0.03
+        reward -= 0.12
 
-    return max(-0.3, min(reward, 0.5))
+    return max(-0.5, min(reward, 0.5))
 
 
 def compute_trajectory_reward(steps: list[dict]) -> float:
