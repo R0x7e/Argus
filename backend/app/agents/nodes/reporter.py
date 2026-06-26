@@ -55,7 +55,7 @@ def _render_template(template_name: str, context: dict) -> str:
     return template.render(**context)
 
 
-async def _generate_recommendations(findings: list, target_profile: dict) -> list[str]:
+async def _generate_recommendations(findings: list, target_profile: dict, task_id: str = "") -> list[str]:
     """让 LLM 基于发现生成修复建议"""
     if not findings:
         return [
@@ -86,7 +86,7 @@ async def _generate_recommendations(findings: list, target_profile: dict) -> lis
     ]
 
     try:
-        response_text = await llm.call(agent="orchestrator", messages=messages, task_id=task_id)
+        response_text = await llm.call(agent="reporter", messages=messages, task_id=task_id)
         recommendations = json.loads(response_text)
         if isinstance(recommendations, list):
             return recommendations[:10]
@@ -137,7 +137,7 @@ async def reporter_node(state: VulnHuntState) -> dict:
     await emit(task_id, "reporter", "thinking", {
         "content": "正在生成修复建议...",
     })
-    recommendations = await _generate_recommendations(bb.findings, bb.target_profile)
+    recommendations = await _generate_recommendations(bb.findings, bb.target_profile, task_id=task_id)
 
     await emit(task_id, "reporter", "progress", {
         "content": f"生成了 {len(recommendations)} 条修复建议",

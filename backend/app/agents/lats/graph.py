@@ -95,6 +95,7 @@ class LATSState(TypedDict):
     discoveries: list
     expansion_stats: dict
     strategy_hints: dict  # v15: eval → select 反馈通道
+    current_phase: str  # reporter 节点返回的当前阶段标识
 
 
 # ──── Node: Recon ────
@@ -394,6 +395,9 @@ async def lats_init_tree_node(state: dict) -> dict:
         else:
             single_endpoints = [{"path": target_path or "/", "params": [], "source": "target_url"}]
         endpoints_to_process = single_endpoints
+        # P1-2: 在 single_page 模式下，限制只测试 focus_vuln_types
+        # 这样可以避免 Agent 被无关漏洞类型分散注意力
+        logger.info("single_page: focus_vuln_types=%s, endpoints=%s", focus_vuln_types, [e['path'] for e in single_endpoints])
     else:
         endpoints_to_process = attack_surface.get("endpoints", [])
 
@@ -443,7 +447,7 @@ async def lats_init_tree_node(state: dict) -> dict:
                     value_estimate=value, created_at_cycle=0,
                 )
                 child.status = NodeStatus.SEED  # v2
-                branches_created += 1
+                branches_created += 1 
 
     # v5: 为 URL 推断参数创建分支 (打破 auth_bypass 垄断)
     for inferred in url_inferred_params:
@@ -1232,4 +1236,5 @@ def create_lats_initial_state(
         "discoveries": [],
         "expansion_stats": {},
         "strategy_hints": {},
+        "current_phase": "initializing",
     }

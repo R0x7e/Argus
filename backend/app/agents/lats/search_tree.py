@@ -164,17 +164,29 @@ class SearchTree:
         return self.PRIOR_INITIAL_WEIGHT * math.exp(-s / self.PRIOR_DECAY_STEPS)
 
     def _wilson_score_lower_bound(self, node: SearchNode) -> float:
+        """Wilson 分数下界估计
+        
+        将节点的平均奖励映射到 [0, 1] 概率空间，计算置信下界。
+        当平均奖励为负时，下界为 0（表示该节点不可靠）。
+        """
         n = node.visit_count
-        if n >= 5:
-            return node.total_reward / n if n > 0 else 0.0
         if n == 0:
             return 0.0
-        p = node.total_reward / n
+        
+        # 计算平均奖励并映射到 [0, 1] 范围
+        # 奖励范围通常是 [-0.5, 1.0]，需要线性映射
+        avg_reward = node.total_reward / n
+        # 使用 sigmoid 映射：将任意实数映射到 (0, 1)
+        # 或者简单线性映射：假设奖励范围 [-0.5, 1.0] -> [0, 1]
+        p = max(0.0, min(1.0, (avg_reward + 0.5) / 1.5))  # 线性映射 [-0.5, 1.0] -> [0, 1]
+        
         z = self.WILSON_CONFIDENCE_Z
         z2 = z * z
         denominator = 1.0 + z2 / n
         mean = (p + z2 / (2.0 * n)) / denominator
-        std = z * math.sqrt((p * (1.0 - p) / n + z2 / (4.0 * n * n))) / denominator
+        # p 已在 [0, 1] 范围内，p * (1 - p) >= 0，sqrt 不会报 domain error
+        variance = p * (1.0 - p) / n + z2 / (4.0 * n * n)
+        std = z * math.sqrt(max(0.0, variance)) / denominator  # max(0,...) 防御性保护
         return max(0.0, mean - std)
 
     def _node_similarity(self, a: SearchNode, b: SearchNode) -> float:

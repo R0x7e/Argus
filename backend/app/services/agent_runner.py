@@ -174,6 +174,9 @@ class AgentRunner:
         from app.agents.lats.graph import register_task_llm_client, unregister_task_llm_client
         from app.config import get_settings
 
+        # 将 str task_id 转换为 uuid.UUID，供 TaskService 数据库操作使用
+        task_uuid = uuid_mod.UUID(task_id) if isinstance(task_id, str) else task_id
+
         task_llm = LLMClient()
         task_llm.token_budget = TokenBudget(task_id=task_id, total_budget=500_000)
         register_task_llm_client(task_id, task_llm)
@@ -258,8 +261,8 @@ class AgentRunner:
                 # 更新任务状态为完成，并记录发现数量
                 task_svc = TaskService(db)
                 findings_count = len(bb.findings) if bb else 0
-                await task_svc.transition_status(task_id, "done")
-                task_obj = await task_svc.get_task(task_id)
+                await task_svc.transition_status(task_uuid, "done")
+                task_obj = await task_svc.get_task(task_uuid)
                 iterations = result.get("iteration_count", 0) or result.get("current_cycle", 0)
                 task_obj.progress = {
                     **(task_obj.progress or {}),
@@ -296,7 +299,7 @@ class AgentRunner:
             async with self._session_factory() as db:
                 task_svc = TaskService(db)
                 await task_svc.transition_status(
-                    task_id,
+                    task_uuid,
                     "terminated",
                     error_info={
                         "error_type": "CancelledError",
@@ -315,7 +318,7 @@ class AgentRunner:
                 task_svc = TaskService(db)
                 try:
                     await task_svc.transition_status(
-                        task_id,
+                        task_uuid,
                         "failed",
                         error_info={
                             "error_type": "TimeoutError",
@@ -343,7 +346,7 @@ class AgentRunner:
                 task_svc = TaskService(db)
                 try:
                     await task_svc.transition_status(
-                        task_id,
+                        task_uuid,
                         "failed",
                         error_info={
                             "error_type": type(e).__name__,

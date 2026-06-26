@@ -438,7 +438,8 @@ async def _execute_batch_inject(params: dict, context: ExecutionContext, registr
         # 异常检测 (P0-2: 独立 if 检查, 不再用 elif 链)
         if r_status != bl_status and r_status not in (404, 403):
             anomalies.append(f"status {bl_status}→{r_status}: {payload[:40]}")
-        if abs(r_len - bl_len) > 50:  # 长度差异
+        # P0-3: 降低长度差异阈值从 50 到 20，并添加 HTML 结构比较
+        if abs(r_len - bl_len) > 20:  # 长度差异（降低阈值）
             anomalies.append(f"len diff {r_len - bl_len}: {payload[:40]}")
         if r_time - bl_time > 1500:  # 时间差异
             anomalies.append(f"time +{r_time - bl_time}ms: {payload[:40]}")
@@ -449,6 +450,21 @@ async def _execute_batch_inject(params: dict, context: ExecutionContext, registr
             r_fp = _re4.sub(r'\d+', '', r_body)
             if bl_fp != r_fp:
                 anomalies.append(f"content fingerprint diff: {payload[:40]}")
+            # P0-3: 添加 HTML 结构比较（表格行数、列表项数）
+            else:
+                # 提取 HTML 结构特征
+                bl_tables = len(_re4.findall(r'<tr[^>]*>', bl_fp, _re4.I))
+                r_tables = len(_re4.findall(r'<tr[^>]*>', r_fp, _re4.I))
+                bl_lists = len(_re4.findall(r'<li[^>]*>', bl_fp, _re4.I))
+                r_lists = len(_re4.findall(r'<li[^>]*>', r_fp, _re4.I))
+                if bl_tables != r_tables or bl_lists != r_lists:
+                    anomalies.append(f"HTML structure diff (tables:{bl_tables}→{r_tables}, lists:{bl_lists}→{r_lists}): {payload[:40]}")
+                # P0-3: 添加关键词匹配（检测“无结果”等提示）
+                no_result_keywords = ['no result', 'empty', 'not found', 'no data', '无结果', '无数据', '未找到', 'no record']
+                bl_has_no_result = any(kw in baseline_body.lower() for kw in no_result_keywords)
+                r_has_no_result = any(kw in r_body.lower() for kw in no_result_keywords)
+                if bl_has_no_result != r_has_no_result:
+                    anomalies.append(f"no_result keyword diff (baseline:{bl_has_no_result}, injected:{r_has_no_result}): {payload[:40]}")
 
     summary = f"batch_inject: {len(results)} payloads"
     if anomalies:

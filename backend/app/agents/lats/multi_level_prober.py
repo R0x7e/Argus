@@ -50,7 +50,8 @@ class ProbeResult:
 # ──── 漏洞类型 → 代表性探测 payload ────
 
 _VULN_TYPE_PROBE_PAYLOAD: dict[str, str] = {
-    "sql_injection": "' OR '1'='1",
+    "sql_injection": "' OR '1'='1",  # 字符串型 SQL 注入
+    "sql_injection_numeric": "1 OR 1=1",  # P2-2: 数字型 SQL 注入
     "xss": "<script>",
     "lfi": "/etc/passwd",
     "path_traversal": "/etc/passwd",
@@ -151,6 +152,21 @@ class QuickProber:
                 result.inject_status = inject.get("status_code", 0)
                 result.inject_length = len(inject.get("body", "") or "")
                 result.inject_time_ms = inject.get("response_time_ms", 0)
+                # P2-2: 保存注入响应 body 用于内容指纹比较
+                result.signals["inject_body"] = inject.get("body", "") or ""
+                result.signals["baseline_body"] = baseline.get("body", "") or ""
+
+            # P2-2: 对 SQL 注入类型，额外测试数字型 payload
+            if vuln_type == "sql_injection" and param:
+                numeric_payload = _VULN_TYPE_PROBE_PAYLOAD.get("sql_injection_numeric", "1 OR 1=1")
+                numeric = await self._send_request(endpoint, context, param=param, payload=numeric_payload)
+                numeric_len = len(numeric.get("body", "") or "")
+                numeric_time = numeric.get("response_time_ms", 0)
+                # 如果数字型 payload 产生差异，记录信号
+                if (numeric.get("status_code", 0) != result.baseline_status or
+                    abs(numeric_len - result.baseline_length) > 50 or
+                    numeric_time - result.baseline_time_ms > 2000):
+                    signals["numeric_sqli_signal"] = True
 
             # ── 分类判定 ──
             result.verdict = self._classify(result)
@@ -217,19 +233,29 @@ class QuickProber:
         # ── 有信号 → promoted (v2-fix: 收紧阈值) ──
         if r.probe_status != r.baseline_status:
             signals["status_change"] = True
-        # v2-fix: 长度差异阈值从 50→100 bytes
-        if abs(r.probe_length - r.baseline_length) > 100:
+        # P2-2: 降低长度差异阈值从 100→50 bytes，提高敏感度
+        if abs(r.probe_length - r.baseline_length) > 50:
             signals["length_change"] = True
         # v2-fix: 时间差异阈值保持 2000ms (时间盲注有意义)
         if r.probe_time_ms - r.baseline_time_ms > 2000:
             signals["time_anomaly"] = True
         if r.inject_status != r.baseline_status and r.inject_status > 0:
             signals["inject_status_change"] = True
-        # v2-fix: 注入长度差异阈值从 100→200 bytes
-        if abs(r.inject_length - r.baseline_length) > 200:
+        # P2-2: 降低注入长度差异阈值从 200→100 bytes
+        if abs(r.inject_length - r.baseline_length) > 100:
             signals["inject_length_change"] = True
         if r.inject_time_ms - r.baseline_time_ms > 2000:
             signals["inject_time_anomaly"] = True
+
+        # P2-2: 添加内容指纹比较（去数字后对比）
+        baseline_body = signals.get("baseline_body", "")
+        inject_body = signals.get("inject_body", "")
+        if baseline_body and inject_body:
+            import re
+            baseline_fp = re.sub(r'\d+', '', baseline_body)
+            inject_fp = re.sub(r'\d+', '', inject_body)
+            if baseline_fp != inject_fp:
+                signals["content_fingerprint_diff"] = True
 
         # v2-fix: 收紧无变化条件 — 长度阈值 20→80 bytes, 时间 1000→2000ms
         no_change = (
@@ -238,6 +264,8 @@ class QuickProber:
             and abs(r.inject_length - r.baseline_length) < 80
             and r.probe_time_ms - r.baseline_time_ms < 2000
             and r.inject_time_ms - r.baseline_time_ms < 2000
+            and not signals.get("content_fingerprint_diff")
+            and not signals.get("numeric_sqli_signal")
         )
 
         if no_change:

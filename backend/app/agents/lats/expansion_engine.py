@@ -718,6 +718,12 @@ class ExpansionEngine:
         if not url:
             return created
 
+        # P1-1: 验证 URL 是有效的路径（以 / 开头或包含域名）
+        # 如果 URL 无效（如包含非 URL 文本），跳过创建
+        if not (url.startswith("/") or "http" in url):
+            logger.warning("跳过无效的端点 URL: %s", url[:100])
+            return created
+
         from urllib.parse import urlparse, parse_qs
 
         path = url
@@ -756,7 +762,12 @@ class ExpansionEngine:
         """为新参数创建注入测试分支 (v5: 独立推断 vuln_type, 不继承父节点)"""
         created = []
         param_name = discovery.data.get("param_name", "")
-        endpoint = discovery.data.get("endpoint", "") or discovery.source_node_id
+        endpoint = discovery.data.get("endpoint", "")
+
+        # P1-1: 验证 endpoint 是有效的 URL 路径（以 / 开头或包含域名）
+        # 如果 endpoint 无效，使用父节点的 current_endpoint
+        if not endpoint or not (endpoint.startswith("/") or "http" in endpoint):
+            endpoint = parent.state.current_endpoint or "/"
 
         if not param_name:
             return created

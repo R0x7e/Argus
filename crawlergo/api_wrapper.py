@@ -42,9 +42,16 @@ def crawl():
     ]
 
     try:
+        # P2-1: 添加更多日志以便调试
+        app.logger.info("Starting crawlergo: url=%s, max_count=%s", url, max_crawl_count)
+        
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=180
         )
+
+        # P2-1: 记录 stderr 以便调试
+        if result.stderr:
+            app.logger.warning("crawlergo stderr: %s", result.stderr[:500])
 
         stdout = result.stdout.strip()
         if stdout:
@@ -52,8 +59,10 @@ def crawl():
             if json_start != -1:
                 output = json.loads(stdout[json_start:])
             else:
+                app.logger.warning("crawlergo output has no JSON: %s", stdout[:200])
                 output = {}
         else:
+            app.logger.warning("crawlergo output is empty")
             output = {}
 
         req_list = output.get("req_list", [])

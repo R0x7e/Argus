@@ -172,8 +172,12 @@ async def react_agent_loop(
             steering_directives=steering_directives,
         )
 
+        # P1-3: 格式化系统提示词，插入当前漏洞类型
+        vuln_type = node.state.vuln_type or "通用漏洞"
+        system_prompt = REACT_SYSTEM_PROMPT.replace("{vuln_type}", vuln_type)
+
         messages = [
-            {"role": "system", "content": REACT_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 

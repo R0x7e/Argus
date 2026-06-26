@@ -103,6 +103,9 @@ class Blackboard:
     # ---- v2: 跨分支共享知识库 ----
     shared_knowledge: Any = field(default=None)  # SharedKnowledge 实例 (延迟初始化)
 
+    # ---- v2: LATS 运行时动态字段 ----
+    focus_vuln_types: list = field(default_factory=list)  # LATS 目标漏洞类型 (由 init_tree 设置)
+
 
 class VulnHuntState(TypedDict):
     """
