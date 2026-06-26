@@ -132,7 +132,9 @@ class LLMClient:
         if db_provider:
             self._provider_config = db_provider
             if db_provider.default_model:
-                self.model_router.update_default_model(db_provider.default_model)
+                # 非 Anthropic 供应商: fallback 使用同一模型 (避免不支持的 claude-haiku-4-5)
+                fb_model = None if db_provider.provider_type == "anthropic" else db_provider.default_model
+                self.model_router.update_default_model(db_provider.default_model, fallback_model=fb_model)
             logger.info(
                 "使用数据库配置的 LLM 供应商: %s (%s)",
                 db_provider.provider_type,
@@ -284,6 +286,9 @@ class LLMClient:
                     continue
 
                 logger.error("LLM 调用失败 (第 %d/%d 次): %s", attempt, max_retries, str(e))
+                # 检测模型名不兼容错误并记录明确日志
+                if any(kw in error_msg for kw in ("not found", "does not exist", "not supported", "invalid model")):
+                    logger.error("⚠️ 模型名 '%s' 不被供应商 '%s' 支持，请检查 fallback 配置", model_id, config.provider_type)
                 if attempt < max_retries:
                     await asyncio.sleep(1)
                     continue

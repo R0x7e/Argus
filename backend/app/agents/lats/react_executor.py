@@ -188,6 +188,30 @@ async def react_agent_loop(
             )
         except Exception as e:
             logger.error("ReAct LLM 调用失败: %s", str(e))
+            # 安全网: LLM 不可用时对明确 vuln_type 的节点执行确定性检测
+            _fb_vuln_type = state.vuln_type if hasattr(state, 'vuln_type') else ''
+            _fb_param = state.current_param if hasattr(state, 'current_param') else ''
+            _fb_target_url = state.target_url if hasattr(state, 'target_url') else ''
+            if _fb_param and _fb_vuln_type == "sql_injection" and _fb_target_url:
+                try:
+                    _fb_obs = await execute_action(
+                        "sqli_detect", {"url": _fb_target_url, "param": _fb_param, "method": "GET"},
+                        context, state,
+                    )
+                    if _fb_obs.vuln_confirmed:
+                        steps.append(ThoughtStep(
+                            thought="LLM 不可用，执行确定性 sqli_detect 降级检测",
+                            action="sqli_detect", action_params={"url": _fb_target_url, "param": _fb_param},
+                            observation=_fb_obs.summary,
+                        ))
+                        return ReactResult(
+                            node_id=node.id, status="finding", steps=steps,
+                            reward=1.0, finding=_fb_obs.finding,
+                            tool_results=[_fb_obs.tool_call] if _fb_obs.tool_call else [],
+                            new_facts=_fb_obs.new_facts,
+                        )
+                except Exception:
+                    pass
             return ReactResult(
                 node_id=node.id,
                 status="error",

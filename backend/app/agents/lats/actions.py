@@ -438,6 +438,9 @@ async def _execute_batch_inject(params: dict, context: ExecutionContext, registr
         # 异常检测 (P0-2: 独立 if 检查, 不再用 elif 链)
         if r_status != bl_status and r_status not in (404, 403):
             anomalies.append(f"status {bl_status}→{r_status}: {payload[:40]}")
+        # HTTP 500 状态码异常信号 — SQL 注入导致服务器 500 是常见信号
+        if r_status == 500 and bl_status != 500:
+            anomalies.append(f"server error 500 (baseline={bl_status}): {payload[:40]}")
         # P0-3: 降低长度差异阈值从 50 到 20，并添加 HTML 结构比较
         if abs(r_len - bl_len) > 20:  # 长度差异（降低阈值）
             anomalies.append(f"len diff {r_len - bl_len}: {payload[:40]}")
@@ -465,12 +468,47 @@ async def _execute_batch_inject(params: dict, context: ExecutionContext, registr
                 r_has_no_result = any(kw in r_body.lower() for kw in no_result_keywords)
                 if bl_has_no_result != r_has_no_result:
                     anomalies.append(f"no_result keyword diff (baseline:{bl_has_no_result}, injected:{r_has_no_result}): {payload[:40]}")
+            # SQL 错误模式检测 — 复用 _detect_vuln_indicators 的错误模式
+            r_body_lower = r_body.lower()
+            sqli_error_keywords = [
+                "sql syntax", "mysql_fetch", "unclosed quotation",
+                "you have an error in your sql", "pg_query", "ora-01756",
+                "sqlite3.operationalerror", "syntax error", "warning: mysql",
+            ]
+            for kw in sqli_error_keywords:
+                if kw in r_body_lower:
+                    anomalies.append(f"SQL error ('{kw}'): {payload[:40]}")
+                    break
 
     summary = f"batch_inject: {len(results)} payloads"
     if anomalies:
         summary += f", ANOMALIES: {'; '.join(anomalies[:3])}"
     else:
         summary += ", all baseline (no diff)"
+
+    # 自动后验证: batch_inject 无发现 + sqli 场景 → 自动调用专业 sqli_detect
+    if not anomalies and (preset in ("sqli", "auto") or (state and getattr(state, 'vuln_type', '') == 'sql_injection')):
+        sqli_tool = registry.get("sqli_detect")
+        if sqli_tool:
+            try:
+                from urllib.parse import urlparse as _urlparse
+                parsed = _urlparse(url)
+                clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                sqli_result = await sqli_tool.execute(
+                    {"url": clean_url, "param": param, "method": method}, context
+                )
+                if sqli_result.get("vulnerable"):
+                    return Observation(
+                        success=True,
+                        summary=f"batch_inject→sqli_detect 自动确认 SQLi: {sqli_result.get('technique')}",
+                        vuln_confirmed=True, severity="high",
+                        finding={"type": "sql_injection", "evidence": f"auto-confirmed: {sqli_result.get('technique')}",
+                                 "payload": sqli_result.get("payload_used", ""), "url": clean_url, "param": param},
+                        new_facts=[f"SQLi 自动确认: {sqli_result.get('technique')}"],
+                        tool_call={"tool": "sqli_detect", "params": {"url": clean_url, "param": param}, "result": sqli_result},
+                    )
+            except Exception:
+                pass  # 后验证失败不影响原始 batch_inject 结果
 
     return Observation(
         success=True,

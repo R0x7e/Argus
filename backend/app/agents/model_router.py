@@ -45,10 +45,18 @@ class ModelRouter:
         default_factory=lambda: dict(DEFAULT_ROUTING_TABLE)
     )
 
-    def update_default_model(self, model_id: str) -> None:
-        """用数据库配置的默认模型替换路由表中所有 primary 模型"""
+    def update_default_model(self, model_id: str, fallback_model: str | None = None) -> None:
+        """用数据库配置的默认模型替换路由表中所有 primary 模型
+
+        Args:
+            model_id: 主力模型 ID
+            fallback_model: 降级模型 ID。若为 None，则 fallback 与 primary 相同
+                            (非 Anthropic 供应商必须设置，否则 fallback 会使用不支持的模型名)
+        """
+        fb = fallback_model if fallback_model is not None else model_id
         for agent_name in self.routing_table:
             self.routing_table[agent_name]["primary"] = model_id
+            self.routing_table[agent_name]["fallback"] = fb
 
     def select_model(self, agent: str, budget_remaining_ratio: float = 1.0) -> str:
         """
