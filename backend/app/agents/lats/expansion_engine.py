@@ -216,9 +216,11 @@ class DiscoveryExtractor:
                 ))
 
         # 5. 从 finding 中提取新端点信息
+        # note: finding['evidence'] 始终为字符串(漏洞描述文本)，不是 dict，
+        #       URL 只存在于 finding['url'] 中（部分 finding 类型无此字段）
         finding = getattr(result, 'finding', None) or {}
         if finding:
-            url = finding.get('url', '') or finding.get('evidence', {}).get('url', '')
+            url = finding.get('url', '')
             if url:
                 discoveries.append(Discovery(
                     discovery_type=DiscoveryType.NEW_ENDPOINT,

@@ -340,6 +340,14 @@ async def lats_init_tree_node(state: dict) -> dict:
     from urllib.parse import urlparse as _urlparse
     parsed_target = _urlparse(target_url) if target_url else None
     target_path = parsed_target.path if parsed_target else "/"
+
+    # v19-fix: 如果 task_name 推断失败, 从 target_url 路径回退推断 focus_vuln_types
+    if not focus_vuln_types:
+        url_inferred_focus = _infer_vuln_from_path(target_path) if target_path else []
+        if url_inferred_focus and url_inferred_focus != ["info_disclosure", "auth_bypass"]:
+            focus_vuln_types = url_inferred_focus
+            logger.info("focus_vuln_types inferred from URL path: %s", focus_vuln_types)
+            bb.focus_vuln_types = focus_vuln_types
     is_single_page = bool(parsed_target and parsed_target.path and
                           any(parsed_target.path.lower().endswith(ext)
                               for ext in ('.php', '.asp', '.aspx', '.jsp', '.py', '.pl', '.cgi', '.do', '.action')))
@@ -474,8 +482,9 @@ async def lats_init_tree_node(state: dict) -> dict:
                 branches_created += 1
 
     # v8: Fallback — 为每个可注入端点强制创建注入探测分支 (v9: 过滤静态文件)
+    # v19-fix: 使用 endpoints_to_process 而非 attack_surface.endpoints, 避免单页模式下为 dir_scan 结果创建无关分支
     fallback_params = ["id", "q", "file", "url", "cmd", "name", "page"]
-    for endpoint_data in attack_surface.get("endpoints", [])[:10]:
+    for endpoint_data in endpoints_to_process[:10]:
         path = endpoint_data if isinstance(endpoint_data, str) else endpoint_data.get("path", "")
         if not path or path.startswith("http://127"):
             path = target_path or "/"

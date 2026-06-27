@@ -1258,8 +1258,16 @@ async def _execute_run_poc(params: dict, context: ExecutionContext, registry) ->
     vuln_confirmed = False
     severity = ""
 
+    output_lower = output.lower()
+    # 排除否定模式（如 "Not vulnerable"、"not exploitable"、"no delay"）
+    negation_patterns = [
+        "not vulnerable", "not exploitable", "no vulnerability",
+        "no delay", "not affected", "not susceptible",
+    ]
+    has_negation = any(neg in output_lower for neg in negation_patterns)
+    # 正向指标（仅在无否定模式时才确认漏洞）
     success_indicators = ["vulnerable", "exploited", "pwned", "200 ok", "success", "flag{"]
-    if any(ind in output.lower() for ind in success_indicators):
+    if not has_negation and any(ind in output_lower for ind in success_indicators):
         vuln_confirmed = True
         severity = "high"
         new_facts.append(f"PoC 执行成功确认漏洞: {output[:200]}")

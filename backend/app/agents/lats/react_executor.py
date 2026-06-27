@@ -381,17 +381,14 @@ async def react_agent_loop(
 
         # === v17: 跟踪连续无信息步 ===
         step_is_info = observation.new_info_gained
-        # batch_inject 无异常时也计为 no_info (虽然 success=true 但无实际进展)
-        obs_lower = (observation.summary or "").lower()
-        if "all baseline" in obs_lower or "全部与基线相同" in obs_lower:
-            step_is_info = False
+        # v19-fix: 移除 batch_inject 的 no_info 特殊判定 — batch_inject 本身是有效信息收集
         if step_is_info:
             consecutive_no_info = 0
         else:
             consecutive_no_info += 1
 
-        # v17: 连续 3 步无信息 → 自动回溯 (曾为 4)
-        if consecutive_no_info >= 3:
+        # v19-fix: 连续 5 步无信息 → 自动回溯 (曾为 3, 给 Agent 更多探索空间)
+        if consecutive_no_info >= 5:
             logger.info("连续 %d 步无新信息，自动回溯", consecutive_no_info)
             return ReactResult(
                 node_id=node.id,
