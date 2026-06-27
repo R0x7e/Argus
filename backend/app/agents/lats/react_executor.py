@@ -167,10 +167,27 @@ async def react_agent_loop(
             for s in steps[-5:]
         ]
 
+        # v22-fix: 查询 SharedKnowledge 获取跨Agent成功攻击向量
+        shared_hints = ""
+        try:
+            from .shared_knowledge import SharedKnowledge
+            if hasattr(node.state, '_shared_knowledge') and node.state._shared_knowledge:
+                sk = node.state._shared_knowledge
+                shared_hints = sk.format_agent_hints(
+                    state.target_url or state.current_endpoint,
+                    max_hints=3
+                )
+        except Exception:
+            pass
+
         user_prompt = build_react_prompt(
             state_dict, step_history, {"depth": node.depth + step_idx},
             steering_directives=steering_directives,
         )
+
+        # v22: 将跨Agent发现注入到 user prompt
+        if shared_hints:
+            user_prompt = shared_hints + "\n\n" + user_prompt
 
         # P1-3: 格式化系统提示词，插入当前漏洞类型
         vuln_type = node.state.vuln_type or "通用漏洞"

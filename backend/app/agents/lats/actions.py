@@ -88,6 +88,12 @@ class Observation:
     next_payload: str = ""
     filter_rules: dict = field(default_factory=dict)
 
+    # v21: 基线快照 — 供盲检测引擎 BlindVerifier 使用
+    baseline_body: str = ""
+    baseline_len: int = 0
+    baseline_status: int = 0
+    baseline_time_ms: int = 0
+
 
 def _build_inject_url(url: str, param: str, payload: str, method: str = "GET") -> dict:
     """构造注入请求参数"""
@@ -206,6 +212,8 @@ async def _execute_inject(params: dict, context: ExecutionContext, registry, sta
 
     # P0-3: 自动基线比较 — 有参数时自动发送基线请求
     baseline_diff_info = ""
+    # v21: 基线快照默认值
+    bl_body, bl_status, bl_time, bl_orig_len = "", 0, 0, 0
     if param and payload and not skip_baseline:
         try:
             bl_req = _build_inject_url(url, param, baseline_value, method)
@@ -253,6 +261,11 @@ async def _execute_inject(params: dict, context: ExecutionContext, registry, sta
         response_body=body[:2000],
         response_headers=headers,
         response_time_ms=time_ms,
+        # v21: 基线快照 — 供 BlindVerifier 使用
+        baseline_body=bl_body,
+        baseline_len=bl_orig_len,
+        baseline_status=bl_status,
+        baseline_time_ms=bl_time,
         tool_call={"tool": "http_request", "params": req_params, "result": {"status_code": status, "body_len": orig_len, "orig_body_len": orig_len}},
     )
 
@@ -267,6 +280,32 @@ async def _execute_inject(params: dict, context: ExecutionContext, registry, sta
         obs.new_info_gained = True
         obs.new_facts.append(f"基线差异: payload='{payload[:40]}' vs baseline='{baseline_value}'{baseline_diff_info}")
         obs.same_as_baseline = False
+        # v22: 记录成功请求向量 (供其他Agent学习)
+        if "len_diff" in baseline_diff_info and param and url:
+            try:
+                from .shared_knowledge import SuccessfulRequestVector
+                import datetime as _dt
+                len_diff_val = abs(bl_orig_len - orig_len) if bl_orig_len and orig_len else 0
+                if len_diff_val > 0:
+                    vector = SuccessfulRequestVector(
+                        endpoint=url,
+                        method=method or "GET",
+                        param=param,
+                        payload_class=getattr(state, 'vuln_type', 'unknown') if state else 'unknown',
+                        length_diff=len_diff_val,
+                        baseline_length=bl_orig_len,
+                        body_length=orig_len,
+                        evidence=baseline_diff_info,
+                        timestamp=_dt.datetime.now(_dt.timezone.utc).isoformat(),
+                    )
+                    # 通过 context 获取 SharedKnowledge
+                    if hasattr(context, '_shared_knowledge') and context._shared_knowledge:
+                        import asyncio
+                        asyncio.ensure_future(
+                            context._shared_knowledge.record_successful_vector(vector)
+                        )
+            except Exception:
+                pass  # 记录失败不影响主流程
     else:
         obs.same_as_baseline = True
 
@@ -286,8 +325,50 @@ async def _execute_inject(params: dict, context: ExecutionContext, registry, sta
         obs.new_info_gained = True
         obs.new_facts.append(f"Payload 在响应中原样反射 (param={param})")
 
-    # 检测关键指标
-    _detect_vuln_indicators(obs, payload, body, status, headers, time_ms, state)
+    # v21-fix: 布尔盲注通用检测 — 基线差异 + 内容指纹变化 → 可复现差异信号
+    if obs_baseline_diff and not obs.vuln_confirmed:
+        if "content differs" in baseline_diff_info:
+            obs.new_facts.append("布尔盲注信号: 基线vs注入内容指纹不同")
+            obs.new_info_gained = True
+
+    # 检测关键指标 (v21: 传入基线数据供 BlindVerifier 使用)
+    _detect_vuln_indicators(obs, payload, body, status, headers, time_ms, state,
+                            baseline_body=obs.baseline_body,
+                            baseline_len=obs.baseline_len,
+                            baseline_status=obs.baseline_status,
+                            baseline_time_ms=obs.baseline_time_ms)
+
+    # v21: DiagnosticProber — 连续 SAME_AS_BASELINE 时触发诊断
+    if obs.same_as_baseline and not obs.vuln_confirmed and param:
+        try:
+            from .diagnostic_prober import DiagnosticProber
+            # 使用 state 上的计数器跟踪连续失败
+            if state is not None and hasattr(state, '_diag_counter'):
+                state._diag_counter += 1
+            elif state is not None:
+                state._diag_counter = 1
+            if state is not None and getattr(state, '_diag_counter', 0) >= 2:
+                state._diag_counter = 0  # 重置
+                vuln_type = getattr(state, 'vuln_type', 'rce')
+                other_params = [p for p in (getattr(state, 'known_facts', []) or []) if '参数' in str(p)][:3]
+                # 如果没有其他已知参数, 尝试常见参数名
+                if not other_params:
+                    other_params = ["cmd", "id", "q", "file", "url", "name", "page", "ipaddress", "submit"]
+                prober = DiagnosticProber()
+                diag = await prober.diagnose(
+                    endpoint_url=url,
+                    param=param,
+                    original_payload=payload,
+                    vuln_type=vuln_type,
+                    baseline_response={"status": bl_status, "body": bl_body, "len": bl_orig_len,
+                                       "time_ms": bl_time, "headers": {}},
+                    other_params=[p for p in other_params if isinstance(p, str) and p != param][:3],
+                    context=context,
+                )
+                obs.new_facts.append(f"[诊断] {diag.value}: 连续SAME_AS_BASELINE原因={diag.value}")
+                obs.new_info_gained = True
+        except Exception:
+            pass  # 诊断失败不影响主流程
 
     obs.summary = (
         f"status={status}, time={time_ms}ms, "
@@ -303,8 +384,20 @@ async def _execute_inject(params: dict, context: ExecutionContext, registry, sta
     return obs
 
 
-def _detect_vuln_indicators(obs: Observation, payload: str, body: str, status: int, headers: dict, time_ms: int, state: Any = None):
-    """检测各类漏洞确认指标 (v5: 发现明确信号时自动升级节点 vuln_type)"""
+def _has_sleep_payload(payload: str) -> bool:
+    """检查 payload 是否包含时间延迟命令 (v21: 供 RCE/SQLi 时间盲注检测复用)"""
+    import re
+    patterns = [
+        r'sleep\s+\d+', r'ping\s+-[nc]\s+\d+', r'timeout\s+\d+',
+        r'WAITFOR\s+DELAY', r'pg_sleep', r'BENCHMARK', r'DBMS_PIPE',
+    ]
+    return any(re.search(p, payload, re.IGNORECASE) for p in patterns)
+
+
+def _detect_vuln_indicators(obs: Observation, payload: str, body: str, status: int, headers: dict, time_ms: int, state: Any = None,
+                             baseline_body: str = "", baseline_len: int = 0,
+                             baseline_status: int = 0, baseline_time_ms: int = 0):
+    """检测各类漏洞确认指标 (v21: 两层架构 — Layer1类型特定 + Layer2 BlindVerifier)"""
     body_lower = body.lower()
     detected_type = None
 
@@ -339,13 +432,21 @@ def _detect_vuln_indicators(obs: Observation, payload: str, body: str, status: i
         obs.finding = {"type": "ssti", "evidence": "配置信息泄露", "payload": payload}
         detected_type = "ssti"
 
-    # RCE
+    # RCE (output-based)
     rce_indicators = ["uid=", "gid=", "www-data", "root:x:0"]
     if any(ind in body for ind in rce_indicators):
         obs.vuln_confirmed = True
         obs.severity = "critical"
         obs.finding = {"type": "rce", "evidence": "命令执行输出", "payload": payload}
         obs.new_facts.append("RCE 确认: 命令执行结果出现在响应中")
+        detected_type = "rce"
+
+    # v21-fix: RCE 时间盲注检测 — 对无回显的命令注入通过时间延迟确认
+    if not obs.vuln_confirmed and time_ms > 3000 and _has_sleep_payload(payload):
+        obs.vuln_confirmed = True
+        obs.severity = "critical"
+        obs.finding = {"type": "rce", "evidence": f"命令执行时间延迟 {time_ms}ms", "payload": payload}
+        obs.new_facts.append(f"RCE 确认 (time-based): 响应延迟 {time_ms}ms")
         detected_type = "rce"
 
     # SQL Injection (error-based)
@@ -374,6 +475,22 @@ def _detect_vuln_indicators(obs: Observation, payload: str, body: str, status: i
         obs.finding = {"type": "open_redirect", "evidence": f"重定向到 {location}", "payload": payload}
         detected_type = "open_redirect"
 
+    # v21-fix: SSRF 确认 — 之前完全没有 SSRF 检测分支
+    ssrf_indicators = ["root:", "/etc/passwd", "metadata", "169.254.169.254",
+                       "localhost", "127.0.0.1", "internal", "intranet"]
+    if not obs.vuln_confirmed and any(ind in body_lower for ind in ssrf_indicators) and status != 404:
+        obs.vuln_confirmed = True
+        obs.severity = "high"
+        obs.finding = {"type": "ssrf", "evidence": "内网资源响应出现在body中", "payload": payload}
+        obs.new_facts.append("SSRF 确认: 成功访问内网资源")
+        detected_type = "ssrf"
+    if not obs.vuln_confirmed and "file://" in payload and status == 200 and len(body) > 100:
+        obs.vuln_confirmed = True
+        obs.severity = "high"
+        obs.finding = {"type": "ssrf", "evidence": "file:// 协议读取成功", "payload": payload}
+        obs.new_facts.append("SSRF 确认: file://协议读取")
+        detected_type = "ssrf"
+
     # Info Disclosure
     sensitive_patterns = ["password", "secret", "api_key", "private_key", "AWS_SECRET",
                           "DB_PASSWORD", "MYSQL_PASSWORD", "[core]", "repositoryformatversion"]
@@ -389,6 +506,38 @@ def _detect_vuln_indicators(obs: Observation, payload: str, body: str, status: i
         if state.vuln_type != detected_type and state.vuln_type in ("auth_bypass", "info_disclosure", ""):
             state.vuln_type = detected_type
             obs.new_facts.append(f"节点类型自动升级: {state.vuln_type} → {detected_type}")
+
+    # v21: Layer 2 — 统一盲检测引擎 (类型无关的旁路分析)
+    if not obs.vuln_confirmed and state is not None:
+        try:
+            from .blind_verifier import get_blind_verifier
+            vuln_type = getattr(state, 'vuln_type', '')
+            verifier = get_blind_verifier()
+            result = verifier.verify(
+                payload=payload, body=body,
+                time_ms=time_ms, status=status,
+                vuln_type=vuln_type,
+                baseline_body=baseline_body,
+                baseline_len=baseline_len,
+                baseline_status=baseline_status,
+                baseline_time_ms=baseline_time_ms,
+            )
+            if result and result.confirmed:
+                obs.vuln_confirmed = True
+                severity_map = {"rce": "critical", "sql_injection": "high",
+                                "ssrf": "high", "lfi": "high", "ssti": "high"}
+                obs.severity = severity_map.get(vuln_type, "high")
+                obs.finding = {
+                    "type": vuln_type,
+                    "evidence": f"[{result.method}] {result.evidence}",
+                    "payload": payload,
+                    "blind_method": result.method,
+                }
+                obs.new_facts.append(
+                    f"{vuln_type.upper()} 确认 (blind-{result.method}): {result.evidence}"
+                )
+        except Exception:
+            pass  # 盲检测失败不影响主流程
 
 
 async def _execute_batch_inject(params: dict, context: ExecutionContext, registry, state: Any = None) -> Observation:

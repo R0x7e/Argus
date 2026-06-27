@@ -57,6 +57,27 @@ class VulnSignal:
     source_node_id: str = ""
 
 
+@dataclass
+class SuccessfulRequestVector:
+    """成功的请求向量记录 (v22: 跨Agent知识共享)
+
+    记录任何产生响应差异的请求组合，供其他Agent学习。
+    解决"Auth_bypass Agent发现POST有效但RCE Agent不知道"的问题。
+    """
+    endpoint: str
+    method: str            # GET / POST / PUT
+    param: str             # 产生响应的参数名
+    payload_class: str     # 使用的payload类别 (rce/sqli/xss/...)
+    content_type: str = "" # application/x-www-form-urlencoded
+    form_fields: list = field(default_factory=list)  # 附加表单字段
+    status_code: int = 0
+    body_length: int = 0
+    baseline_length: int = 0
+    length_diff: int = 0
+    evidence: str = ""
+    timestamp: str = ""
+
+
 class SharedKnowledge:
     """
     跨分支共享知识库
@@ -107,6 +128,9 @@ class SharedKnowledge:
 
         # ── 最近变更追踪 (用于 Graveyard 复活) ──
         self._recent_changes: list[str] = []
+
+        # ── v22: 成功请求向量 (跨Agent知识共享) ──
+        self.successful_vectors: dict[str, list[SuccessfulRequestVector]] = {}  # endpoint → vectors
 
     # ──── 写入接口 ────
 
@@ -377,4 +401,64 @@ class SharedKnowledge:
             "vuln_signal_count": sum(len(s) for s in self.vuln_signals.values()),
             "tech_stack": self.tech_stack.get("confirmed", []),
             "explorations_completed": len(self.exploration_history),
+            "successful_vectors_count": sum(len(v) for v in self.successful_vectors.values()),
         }
+
+    # ──── v22: 成功请求向量 (跨Agent知识共享) ────
+
+    async def record_successful_vector(self, vector: SuccessfulRequestVector) -> None:
+        """记录成功的请求向量，供其他 Agent 查询"""
+        async with self._lock:
+            ep_key = vector.endpoint
+            if ep_key not in self.successful_vectors:
+                self.successful_vectors[ep_key] = []
+            # 去重：已有相同 (method, param, form_fields) 的向量则跳过
+            for existing in self.successful_vectors[ep_key]:
+                if (existing.method == vector.method
+                        and existing.param == vector.param
+                        and set(existing.form_fields) == set(vector.form_fields)):
+                    # 更新差异（可能更大）
+                    if vector.length_diff > existing.length_diff:
+                        existing.length_diff = vector.length_diff
+                        existing.evidence = vector.evidence
+                    return
+            self.successful_vectors[ep_key].append(vector)
+            # 保留最近 20 个
+            if len(self.successful_vectors[ep_key]) > 20:
+                self.successful_vectors[ep_key] = self.successful_vectors[ep_key][-20:]
+            self._recent_changes.append("successful_vector")
+
+    def get_successful_vectors(self, endpoint: str) -> list[SuccessfulRequestVector]:
+        """获取指定端点上所有 Agent 发现的有效请求向量"""
+        return self.successful_vectors.get(endpoint, [])
+
+    def get_best_vector(self, endpoint: str, vuln_type: str) -> SuccessfulRequestVector | None:
+        """获取最适合指定漏洞类型的成功向量"""
+        vectors = self.get_successful_vectors(endpoint)
+        if not vectors:
+            return None
+        # 优先：payload_class 匹配的 + 最大差异
+        matching = [v for v in vectors if v.payload_class == vuln_type]
+        candidates = matching or vectors
+        return max(candidates, key=lambda v: v.length_diff)
+
+    def format_agent_hints(self, endpoint: str, max_hints: int = 3) -> str:
+        """格式化跨Agent发现提示 (供Agent prompt注入)"""
+        vectors = self.get_successful_vectors(endpoint)
+        if not vectors:
+            return ""
+        hints = []
+        for v in vectors[-max_hints:]:
+            extra = ""
+            if v.form_fields:
+                extra = f"(含附加字段: {','.join(v.form_fields)})"
+            hints.append(
+                f"  {v.method} {v.param} {extra} → {v.length_diff}字节差异 ({v.evidence[:60]})"
+            )
+        if hints:
+            return (
+                "【跨Agent发现】同一端点上其他Agent成功触发了响应差异:\n"
+                + "\n".join(hints)
+                + "\n请优先使用上述参数/方法组合来测试你的payload。"
+            )
+        return ""

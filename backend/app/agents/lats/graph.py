@@ -96,6 +96,9 @@ class LATSState(TypedDict):
     expansion_stats: dict
     strategy_hints: dict  # v15: eval → select 反馈通道
     current_phase: str  # reporter 节点返回的当前阶段标识
+    # v21: HDE 架构 — 端点聚焦探索模式
+    exploration_mode: str  # "tree"(默认,MCTS) | "endpoint"(新HDE)
+    endpoint_explorer: Any  # EndpointExplorer 实例(仅 endpoint 模式使用)
 
 
 # ──── Node: Recon ────
@@ -310,6 +313,88 @@ def _infer_params_from_url(url: str) -> list[dict]:
     return params
 
 
+# ──── v21: HDE 端点上下文初始化 ────
+
+async def _init_endpoint_contexts(state: dict, bb, task_id: str, task_config: dict,
+                                   attack_surface: dict, target_url: str,
+                                   tech_stack: list, focus_vuln_types: list,
+                                   scan_mode: str) -> dict:
+    """初始化端点聚焦探索上下文 (替代 SearchTree 创建)"""
+    import uuid as _uuid
+    from .endpoint_explorer import EndpointExplorer, PerEndpointContext
+
+    explorer = EndpointExplorer()
+    url_inferred_vulns = _infer_vuln_from_path(
+        target_url.split("?")[0]) if target_url else []
+
+    # 收集端点列表
+    endpoints = attack_surface.get("endpoints", [])
+    if scan_mode == "single_page":
+        parsed = __import__('urllib.parse', fromlist=['urlparse']).urlparse(target_url)
+        target_path = parsed.path if parsed else "/"
+        endpoints = [{"path": target_path, "params": [], "source": "target_url"}]
+
+    for ep_data in endpoints[:20]:  # 最多 20 个端点
+        if isinstance(ep_data, str):
+            path = ep_data
+            params = []
+            source = "dir_scan"
+        elif isinstance(ep_data, dict):
+            path = ep_data.get("path", "")
+            params = ep_data.get("params", [])
+            source = ep_data.get("source", "dir_scan")
+        else:
+            continue
+        if not path:
+            continue
+
+        # 跳过静态文件和版本控制路径
+        if not _is_endpoint_injectable(path):
+            continue
+
+        # 路径暗示的漏洞类型
+        path_hints = _infer_vuln_from_path(path) if path else []
+        if not path_hints or path_hints == ["info_disclosure", "auth_bypass"]:
+            path_hints = ["info_disclosure", "auth_bypass"]
+
+        # 如果有 focus_vuln_types，优先这些类型
+        if focus_vuln_types:
+            path_hints = [vt for vt in focus_vuln_types if vt in path_hints] + path_hints
+
+        ctx = PerEndpointContext(
+            endpoint_id=str(_uuid.uuid4()),
+            endpoint_path=path,
+            full_url=target_url if scan_mode == "single_page"
+                     else (target_url.rstrip("/") + "/" + path.lstrip("/")),
+            source=source,
+            path_hints=path_hints[:4],
+            known_params=params if isinstance(params, list) else [],
+        )
+        explorer.add_context(ctx)
+
+    logger.info("HDE endpoint init: %d contexts (mode=%s)", len(explorer.contexts), scan_mode)
+
+    await emit(task_id, "lats_init", "endpoints_initialized", {
+        "endpoints_count": len(explorer.contexts),
+        "scan_mode": scan_mode,
+        "focus_vuln_types": focus_vuln_types,
+    })
+    await emit(task_id, "lats_init", "agent_stopped", {"node": "init_tree"})
+
+    return {
+        "endpoint_explorer": explorer,
+        "current_cycle": 0,
+        "events": [{
+            "id": str(_uuid.uuid4()),
+            "agent": "lats_init",
+            "type": "endpoints_initialized",
+            "timestamp": __import__('datetime', fromlist=['datetime']).datetime.now(
+                __import__('datetime', fromlist=['timezone']).timezone.utc).isoformat(),
+            "data": {"endpoints_count": len(explorer.contexts)},
+        }],
+    }
+
+
 # ──── Node: Init Tree (v2: 使用 SEED 状态) ────
 
 async def lats_init_tree_node(state: dict) -> dict:
@@ -356,6 +441,13 @@ async def lats_init_tree_node(state: dict) -> dict:
     logger.info("init_tree scan_mode=%s target=%s", scan_mode, target_url)
 
     await emit(task_id, "lats_init", "agent_started", {"node": "init_tree", "scan_mode": scan_mode})
+
+    # v21: HDE 探索模式选择
+    exploration_mode = state.get("exploration_mode", "tree")
+    if exploration_mode == "endpoint":
+        return await _init_endpoint_contexts(state, bb, task_id, task_config,
+                                              attack_surface, target_url, tech_stack,
+                                              focus_vuln_types, scan_mode)
 
     tree = SearchTree()
 
@@ -440,6 +532,10 @@ async def lats_init_tree_node(state: dict) -> dict:
         for param in params:
             param_name = param if isinstance(param, str) else param.get("name", "")
             vuln_types = infer_vuln_types(param_name, endpoint, tech_stack)
+            # v21: 端点路径语义过滤 — 路径明确时仅创建匹配类型分支
+            path_hints = _infer_vuln_from_path(path) if path else []
+            if path_hints and path_hints != ["info_disclosure", "auth_bypass"]:
+                vuln_types = [vt for vt in vuln_types if vt in path_hints] or vuln_types[:1]
             for vtype in vuln_types:
                 branch_key = f"{vtype}@{path}:{param_name}"
                 if branch_key in seen_branches:
@@ -505,6 +601,11 @@ async def lats_init_tree_node(state: dict) -> dict:
                 # P1-2: 如果有 focus_vuln_types, 不为不相关的 vuln_type 创建分支
                 if focus_vuln_types and vt not in focus_vuln_types:
                     continue
+                # v21: 路径语义过滤 — 路径明确时跳过不匹配的 vuln_type
+                fb_path_hints = _infer_vuln_from_path(path) if path else []
+                if fb_path_hints and fb_path_hints != ["info_disclosure", "auth_bypass"]:
+                    if vt not in fb_path_hints:
+                        continue
                 bk = f"{vt}@{path}:{fb_param}"
                 if bk in seen_branches:
                     continue
@@ -590,6 +691,39 @@ async def lats_mcts_select_node(state: dict) -> dict:
     cycle = state.get("current_cycle", 0)
 
     await emit(task_id, "lats_mcts", "agent_started", {"node": "mcts_select", "cycle": cycle})
+
+    # v21: HDE 端点模式 — 使用 EndpointSelector 替代 MCTS select_batch
+    exploration_mode = state.get("exploration_mode", "tree")
+    if exploration_mode == "endpoint":
+        explorer = state.get("endpoint_explorer")
+        if explorer is not None:
+            from .endpoint_selector import EndpointSelector
+            selector = EndpointSelector(
+                focus_vuln_types=bb.focus_vuln_types if hasattr(bb, 'focus_vuln_types') else None
+            )
+            active = explorer.get_active_contexts()
+            if not active:
+                await emit(task_id, "lats_mcts", "agent_stopped", {"node": "mcts_select"})
+                return {"selected_nodes": [], "events": []}
+            selected_ctxs = selector.select_top_k(active, k=batch_size)
+            # 将 PerEndpointContext 映射回 selected_nodes (兼容下游节点)
+            selected_ids = [ctx.endpoint_id for ctx in selected_ctxs]
+            selected_info = [ctx.to_dict() for ctx in selected_ctxs]
+            await emit(task_id, "lats_mcts", "endpoints_selected", {
+                "count": len(selected_ctxs), "endpoints": selected_info,
+                "mode": "endpoint",
+            })
+            await emit(task_id, "lats_mcts", "agent_stopped", {"node": "mcts_select"})
+            return {
+                "selected_nodes": selected_ids,
+                "events": [{
+                    "id": str(uuid.uuid4()),
+                    "agent": "lats_mcts",
+                    "type": "endpoints_selected",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "data": {"count": len(selected_ctxs), "endpoints": selected_info},
+                }],
+            }
 
     # v15: 动态 batch_size — 有发现时加并发, 无进展时减并发
     dry = state.get("dry_cycles", 0)
@@ -753,6 +887,12 @@ async def lats_react_execute_node(state: dict) -> dict:
 
     pool = _get_executor_pool()
     llm = _get_llm_client(task_id)
+
+    # v22: 将 SharedKnowledge 注入到每个节点的 state 中 (供跨Agent知识共享)
+    if bb.shared_knowledge and nodes:
+        for n in nodes:
+            n.state._shared_knowledge = bb.shared_knowledge
+
     results = await pool.execute_batch(
         nodes, context, llm, max_steps,
         steering_directives=steering_directives,
@@ -1239,6 +1379,10 @@ def create_lats_initial_state(
     if tc_max > max_cycles:
         max_cycles = tc_max
 
+    # v21: HDE 探索模式 — 从 task_config 读取, 默认 "tree"(兼容旧行为)
+    exploration_mode = task_config.get("exploration_mode",
+                        task_config.get("config", {}).get("exploration_mode", "tree"))
+
     return {
         "blackboard": bb,
         "search_tree": None,
@@ -1256,4 +1400,6 @@ def create_lats_initial_state(
         "expansion_stats": {},
         "strategy_hints": {},
         "current_phase": "initializing",
+        "exploration_mode": exploration_mode,
+        "endpoint_explorer": None,
     }
