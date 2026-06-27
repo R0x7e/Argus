@@ -782,6 +782,19 @@ class ExpansionEngine:
         if not vuln_types or vuln_types == ["xss", "sql_injection"]:
             vuln_types = ["sql_injection", "xss", "idor", "auth_bypass"]
 
+        # v20-fix: 从 endpoint 路径获取理应存在的漏洞类型, 避免为 RCE 端点创建 SQLi 分支
+        try:
+            from app.agents.lats.graph import _infer_vuln_from_path
+            path_inferred = _infer_vuln_from_path(endpoint) if endpoint else []
+        except ImportError:
+            path_inferred = []
+        if path_inferred and path_inferred != ["info_disclosure", "auth_bypass"]:
+            effective = [vt for vt in vuln_types if vt in path_inferred]
+            if effective:
+                vuln_types = effective
+            else:
+                vuln_types = vuln_types[:1]  # 路径不匹配→保守只创建1个
+
         for vuln_type in vuln_types[:4]:
             child = tree.create_child_node(
                 parent=parent,

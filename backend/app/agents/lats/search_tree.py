@@ -300,6 +300,17 @@ class SearchTree:
                     seen_eps.add(ep_prefix)
             if not selected:
                 selected = [n for n in candidates if n.status == NodeStatus.SEED][:batch_size]
+            # v20-fix: 如果多样性过滤后只选出了1个但有多个候选(vuln_type不同), 回退到按vuln_type多样性选取
+            if len(selected) == 1 and len(candidates) > 1:
+                remaining = [n for n in candidates if n not in selected]
+                remaining.sort(key=lambda n: n.value_estimate, reverse=True)
+                seen_types = {selected[0].state.vuln_type}
+                for n in remaining:
+                    if len(selected) >= batch_size:
+                        break
+                    if n.state.vuln_type not in seen_types:
+                        selected.append(n)
+                        seen_types.add(n.state.vuln_type)
             if selected:
                 self._record_selections(selected)
                 return selected
