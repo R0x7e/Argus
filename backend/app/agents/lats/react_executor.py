@@ -148,6 +148,26 @@ async def react_agent_loop(
     all_new_facts: list[str] = []
 
     for step_idx in range(max_steps):
+        # P2: 端点步数预算检查
+        current_ep = node.state.current_endpoint or "/"
+        budget_result = {"can_continue": True}
+        try:
+            if hasattr(context, '_shared_knowledge') and context._shared_knowledge:
+                budget_result = context._shared_knowledge.record_endpoint_step(
+                    current_ep, had_new_info=(consecutive_no_info == 0 and step_idx > 0)
+                )
+        except Exception:
+            pass
+        if not budget_result.get("can_continue", True):
+            logger.info("P2: 端点步数超限 %s: %s", current_ep, budget_result.get("reason"))
+            return ReactResult(
+                node_id=node.id, status="exhausted",
+                reward=accumulated_reward,
+                reason=f"端点预算耗尽: {budget_result.get('reason')}",
+                total_steps=len(steps),
+                steps=[s for s in steps if hasattr(s, 'reward')],
+                new_facts=all_new_facts,
+            )
         # === Thought: 调用 LLM 决定下一步 ===
         state_dict = {
             "target_url": state.target_url,

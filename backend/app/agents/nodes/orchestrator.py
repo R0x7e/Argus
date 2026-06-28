@@ -7,7 +7,7 @@ LangGraph 图中的总指挥节点。负责：
 3. 评估当前进度，决定下一步行动
 4. 当达到最大迭代或有足够发现时，决定结束
 """
-
+import re
 import json
 import logging
 import uuid
@@ -25,19 +25,205 @@ logger = logging.getLogger(__name__)
 _llm_client: LLMClient | None = None
 
 
+
+# ──── P0: 链接分类与评分系统 ────
+
+# 静态资源后缀 (在提取阶段直接过滤)
+_STATIC_ASSET_PATTERN = re.compile(
+    r'\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|pdf|zip|mp4|webp|webm)'
+    r'(\?|#|$)', re.IGNORECASE
+)
+
+# 链接类别定义及基础优先级
+_LINK_CATEGORY_PRIORITY: dict[str, float] = {
+    "vuln_page": 1.0,
+    "api_endpoint": 0.9,
+    "auth_page": 0.85,
+    "dynamic_page": 0.8,
+    "form_handler": 0.75,
+    "admin_page": 0.7,
+    "static_page": 0.5,
+    "config_leak": 0.3,
+    "static_asset": 0.0,   # 直接过滤
+}
+
+# 漏洞关键词 (URL 路径明确暗示漏洞类型)
+_VULN_PATH_KEYWORDS = [
+    'sqli', 'sql', 'xss', 'rce', 'cmd', 'exec', 'upload', 'fileinclude',
+    'fi_local', 'fi_remote', 'ssrf', 'csrf', 'xxe', 'ssti', 'unser',
+    'overpermission', 'idor', 'burteforce', 'brute', 'infoleak',
+    'unsafedownload', 'unsafeupload', 'urlredirect', 'dir',
+]
+
+# 配置/版本控制路径模式
+_CONFIG_PATH_PATTERNS = [
+    '.git/', '.gitconfig', '.env', '.svn/', '.hg/', '.bzr/',
+    'dockerfile', 'docker-compose', '.htaccess', '.htpasswd',
+    'robots.txt', 'sitemap', 'composer.lock', 'package-lock',
+    'yarn.lock', 'Gemfile.lock', '.DS_Store', 'backup', 'dump',
+    'phpinfo', 'info.php', 'test.php',
+]
+
+
+def _classify_link(link: str) -> str:
+    """将链接分类到预定义类别"""
+    link_lower = link.lower()
+
+    # 静态资源 (直接过滤)
+    if _STATIC_ASSET_PATTERN.search(link):
+        return "static_asset"
+
+    # 配置/版本控制泄露
+    if any(p in link_lower for p in _CONFIG_PATH_PATTERNS):
+        return "config_leak"
+
+    # 漏洞测试页面 (路径含 vul/ 或已知漏洞关键词)
+    if '/vul/' in link_lower or '/vuln/' in link_lower:
+        return "vuln_page"
+    if any(f'/{kw}' in link_lower or link_lower.startswith(f'{kw}/')
+           for kw in _VULN_PATH_KEYWORDS):
+        return "vuln_page"
+
+    # API 端点
+    if any(seg in link_lower for seg in ('/api/', '/ajax/', '/rest/', '/graphql', '/rpc/')):
+        return "api_endpoint"
+
+    # 认证页面
+    if any(kw in link_lower for kw in ('login', 'signin', 'auth', 'register', 'signup')):
+        return "auth_page"
+
+    # 管理页面
+    if any(kw in link_lower for kw in ('admin', 'manage', 'dashboard', 'config', 'setting')):
+        return "admin_page"
+
+    # 动态页面 (含文件扩展名)
+    if re.search(r'\.(php|asp|aspx|jsp|py|pl|cgi|do|action|cfm|rb)(\?|#|$)', link, re.I):
+        return "dynamic_page"
+
+    # 表单处理器
+    if any(kw in link_lower for kw in ('submit', 'post', 'save', 'update', 'delete', 'create')):
+        return "form_handler"
+
+    # 其余有扩展名的视为静态页面
+    if '.' in link.split('/')[-1]:
+        return "static_page"
+
+    # 无扩展名但有目录结构
+    if '/' in link:
+        return "form_handler"  # 可能是 RESTful 端点
+
+    return "static_page"
+
+
+def _score_link(link: str, category: str) -> float:
+    """对链接进行质量评分 (0.0-1.0)"""
+    base = _LINK_CATEGORY_PRIORITY.get(category, 0.3)
+    link_lower = link.lower()
+
+    # 加分项
+    if '?' in link:
+        base += 0.1                          # 带 query string → 高度可注入
+    if any(p in link_lower for p in ('id=', 'q=', 'cmd=', 'file=', 'url=', 'page=')):
+        base += 0.1                          # 常见注入参数
+    if re.search(r'\.(php|asp|aspx|jsp|py)(\?|#|$)', link, re.I):
+        base += 0.05                         # 动态脚本语言
+
+    # 减分项
+    if link.count('/') <= 1 and category not in ('vuln_page', 'auth_page'):
+        base -= 0.1                          # 浅路径 → 大概率不是注入点
+    if link_lower in ('/', '/index.php', '/index.html', '/index.asp'):
+        base = max(0.3, base - 0.3)          # 首页本身不是好注入目标
+
+    return max(0.0, min(1.0, base))
+
+
+def _classify_and_score_links(all_links: list[str]) -> dict:
+    """对所有链接分类并评分，返回分组排序后的结构化结果"""
+    import collections
+
+    categorized: dict[str, list[dict]] = collections.defaultdict(list)
+
+    for link in all_links:
+        cat = _classify_link(link)
+        if cat == "static_asset":
+            continue
+        score = _score_link(link, cat)
+        categorized[cat].append({"link": link, "score": round(score, 2)})
+
+    # 每类内部按评分降序
+    for cat in categorized:
+        categorized[cat].sort(key=lambda x: x["score"], reverse=True)
+
+    return dict(categorized)
+
+
+def _extract_smart_body_snippets(html: str, max_snippets: int = 8) -> list[str]:
+    """智能提取页面的关键区域片段 (替代粗暴的 body[:3000])"""
+    snippets = []
+    html_lower = html.lower()
+
+    # 1. 提取所有 <form> 区域
+    for m in re.finditer(r'<form[^>]*>.*?</form>', html, re.I | re.DOTALL):
+        snippet = m.group(0)[:500]
+        snippets.append(f"[FORM] {snippet}")
+        if len(snippets) >= max_snippets:
+            break
+
+    # 2. 提取包含 input/textarea/select 的区域 (非 form 内的)
+    if len(snippets) < max_snippets:
+        for m in re.finditer(
+            r'(<(?:input|textarea|select)[^>]*name=["\'][^"\']+["\'][^>]*>)', html, re.I
+        ):
+            snippet = m.group(0)[:300]
+            if snippet not in str(snippets):
+                snippets.append(f"[INPUT] {snippet}")
+            if len(snippets) >= max_snippets:
+                break
+
+    # 3. 提取注释中的敏感信息
+    if len(snippets) < max_snippets:
+        for m in re.finditer(r'<!--(.*?)-->', html, re.I | re.DOTALL):
+            comment = m.group(1).strip()
+            if len(comment) > 10 and any(
+                kw in comment.lower() for kw in ('todo', 'fix', 'hack', 'debug', 'password',
+                                                  'secret', 'key', 'sql', 'query')
+            ):
+                snippets.append(f"[COMMENT] {comment[:300]}")
+            if len(snippets) >= max_snippets:
+                break
+
+    # 4. 提取 JavaScript 中的端点引用
+    if len(snippets) < max_snippets:
+        js_matches = re.findall(
+            r'''(?:fetch|axios\.\w+|\.post|\.get|\.ajax)\s*\(\s*["']([^"']+)["']''',
+            html, re.I
+        )
+        for js_url in js_matches[:3]:
+            snippets.append(f"[JS_ENDPOINT] {js_url}")
+
+    return snippets
+
+
 def _extract_links(html: str) -> list[str]:
-    """从 HTML 中提取所有链接路径"""
-    import re
+    """从 HTML 中提取所有链接路径 (P0: 分类评分版, 不排序)"""
     links = set()
     for match in re.finditer(r'(?:href|action|src)=["\']([^"\'#]+)["\']', html, re.IGNORECASE):
         link = match.group(1)
-        if link.startswith(("javascript:", "mailto:", "data:")):
+        if link.startswith(("javascript:", "mailto:", "data:", "tel:")):
             continue
-        if link.startswith("/") or (not link.startswith("http") and "." in link):
+
+        # P5: 静态资源在提取阶段即过滤
+        if _STATIC_ASSET_PATTERN.search(link):
+            continue
+
+        # 绝对路径或以 / 开头
+        if link.startswith("/") or link.startswith("http"):
             links.add(link.split("?")[0])
-        elif link.startswith("http"):
-            links.add(link)
-    return sorted(links)
+        # P5: 相对路径 — 含有文件扩展名或目录结构的都保留
+        elif "/" in link or "." in link:
+            links.add(link.split("?")[0])
+
+    return list(links)  # 不排序, 由分类器排序
 
 
 def _extract_forms(html: str) -> list[dict]:
@@ -190,14 +376,29 @@ async def _run_reconnaissance(state: VulnHuntState) -> dict:
         body = homepage_result.get("body", "") or ""
         links = _extract_links(body)
         all_links = links[:]
+        # P0: 链接分类与评分
+        categorized = _classify_and_score_links(links)
+        # P0: 提取评分最高的链接 (用于爬取)
+        scored_links = []
+        for cat_items in categorized.values():
+            scored_links.extend(cat_items)
+        scored_links.sort(key=lambda x: x["score"], reverse=True)
+        top_scored_paths = [item["link"] for item in scored_links[:60]]
         # 提取页面中的表单和参数
         forms = _extract_forms(body)
         params = _extract_params_from_links(links)
+        # P0: 智能 body 片段
+        smart_snippets = _extract_smart_body_snippets(body)
         recon_results["homepage_info"] = {
             "status_code": homepage_result.get("status_code"),
             "headers": homepage_result.get("headers", {}),
             "body_preview": body[:3000],
-            "links": links[:50],
+            "smart_snippets": smart_snippets,
+            "links": top_scored_paths[:50],
+            "categorized_links": {cat: items[:15] for cat, items in categorized.items()},
+            "total_links": len(links),
+            "forms_count": len(forms),
+            "params_count": len(params),
         }
         recon_results["forms"] = forms
         recon_results["parameters"] = params
@@ -205,17 +406,16 @@ async def _run_reconnaissance(state: VulnHuntState) -> dict:
     elif isinstance(homepage_result, dict):
         recon_results["errors"].append(f"http_request: {homepage_result.get('error', 'unknown')}")
 
-    # === 第二层：递归抓取发现的链接（最多 15 个） ===
+    # === 第二层：递归抓取发现的链接（P0: 评分排序优先爬取高分端点, 最多 15 个） ===
     crawl_targets = []
     base_parsed = urlparse(target_url)
-    for link in all_links[:15]:
+    for link in top_scored_paths[:15]:
         if link.startswith("/"):
             full_url = f"{base_parsed.scheme}://{base_parsed.netloc}{link}"
         elif link.startswith("http"):
             full_url = link
         else:
             full_url = f"{target_url.rstrip('/')}/{link}"
-        # 只爬同域页面，跳过静态资源
         if base_parsed.netloc not in full_url:
             continue
         if re.search(r'\.(css|js|png|jpg|jpeg|gif|svg|ico|woff|ttf|pdf|zip)$', full_url, re.I):
@@ -401,7 +601,7 @@ async def orchestrator_node(state: VulnHuntState) -> dict:
             "params": {"tools": ["dir_scan", "http_request"]},
         })
 
-        # 执行侦察工具
+        # Step 1: 执行侦察工具 (不变)
         recon_results = await _run_reconnaissance(state)
 
         await emit(task_id, "orchestrator", "tool_result", {
@@ -431,81 +631,99 @@ async def orchestrator_node(state: VulnHuntState) -> dict:
             "data": recon_event_data,
         })
 
-        # 将工具结果交给 LLM 生成结构化画像
         task_config = state.get("task_config", {}) or {}
         target_url = task_config.get("target_url", "")
 
+        # Step 2 (NEW): 工具驱动攻击面构造 — 零 LLM
         await emit(task_id, "orchestrator", "thinking", {
-            "content": "正在分析侦察数据，生成目标画像和攻击面...",
+            "content": "正在基于侦察数据构造攻击面...",
         })
 
-        messages = [
-            {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT},
-            {"role": "user", "content": (
-                f"这是一个新的 SRC 漏洞挖掘任务 (ID: {task_id})。目标: {target_url}\n\n"
-                f"以下是对目标的侦察结果：\n"
-                f"- 发现目录/路径: {json.dumps(recon_results['directories'][:30], ensure_ascii=False)}\n"
-                f"- 页面内链接: {json.dumps(recon_results['homepage_info'].get('links', [])[:40], ensure_ascii=False)}\n"
-                f"- 首页响应头: {json.dumps(dict(list(recon_results['homepage_info'].get('headers', {}).items())[:15]), ensure_ascii=False)}\n"
-                f"- 首页内容预览: {recon_results['homepage_info'].get('body_preview', '')[:1500]}\n"
-                f"- 爬取页面数: {len(recon_results.get('crawled_pages', []))}\n"
-                f"- 发现参数: {json.dumps(recon_results.get('parameters', [])[:30], ensure_ascii=False)}\n"
-                f"- 发现表单: {json.dumps(recon_results.get('forms', [])[:15], ensure_ascii=False)}\n\n"
-                f"请基于以上侦察数据，分析目标的技术栈和潜在攻击面。\n"
-                f"注意：这是 SRC 精准漏洞挖掘，不要建议子域名枚举或端口扫描。\n"
-                f"重点关注：\n"
-                f"1. 发现的参数和表单（最可能存在注入漏洞）\n"
-                f"2. 目录扫描中发现的敏感路径\n"
-                f"3. 响应头暴露的技术栈信息\n"
-                f"输出 JSON 格式，包含 target_profile, attack_surface, strategy, next_action 字段。"
-            )},
-        ]
+        from app.agents.lats.attack_surface_builder import build_attack_surface
+        surface = await build_attack_surface(recon_results, target_url, task_id)
+
+        await emit(task_id, "orchestrator", "progress", {
+            "content": f"攻击面构造完成: {surface.total_endpoints} 端点 "
+                       f"({surface.vuln_pages} vuln, {surface.auth_pages} auth, "
+                       f"跳过 {surface.skipped_forbidden} forbidden, {surface.skipped_not_found} not_found)",
+            "step": "attack_surface_built",
+        })
+
+        # Step 3 (NEW): LLM 仅提供策略建议 — 不创建端点
+        await emit(task_id, "orchestrator", "thinking", {
+            "content": "正在分析技术栈并生成策略建议...",
+        })
+
+        endpoint_summary = []
+        for ep in surface.endpoints[:30]:
+            endpoint_summary.append({
+                "path": ep["path"],
+                "score": round(ep.get("score", 0), 2),
+                "category": ep.get("category", "unknown"),
+                "compatible_vulns": ep.get("compatible_vuln_types", [])[:5],
+                "has_forms": ep.get("has_forms", False),
+            })
+
+        smart_snippets = recon_results["homepage_info"].get("smart_snippets", [])
+        snippets_text = "\n".join(f"  - {s[:300]}" for s in smart_snippets[:4]) if smart_snippets else "无"
 
         llm = _get_llm_client()
-        response_text = await llm.call(agent="orchestrator", messages=messages, task_id=task_id)
+        advice_messages = [
+            {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps({
+                "task_id": task_id,
+                "target": target_url,
+                "tech_indicators": surface.recon_summary.get("tech_indicators", []),
+                "server_header": str(
+                    surface.recon_summary.get("headers", {}).get("Server", "")
+                ),
+                "top_endpoints": endpoint_summary,
+                "total_endpoints": surface.total_endpoints,
+                "vuln_pages": surface.vuln_pages,
+                "auth_pages": surface.auth_pages,
+                "forms": surface.forms[:5],
+                "smart_snippets": snippets_text,
+            }, ensure_ascii=False)},
+        ]
+
+        response_text = await llm.call(agent="orchestrator", messages=advice_messages, task_id=task_id)
         decision = _parse_orchestrator_response(response_text)
 
         await emit(task_id, "orchestrator", "progress", {
-            "content": f"目标画像生成完成，策略: {decision.get('strategy', 'unknown')}",
-            "step": "target_profiling",
+            "content": f"策略分析完成: {decision.get('strategy', 'unknown')}, "
+                       f"focus: {decision.get('focus_vuln_types', [])}",
+            "step": "strategy_advice",
         })
 
-        # 更新黑板 —— 融合工具实际结果 + LLM 分析
-        target_profile = decision.get("target_profile", {})
-        target_profile["base_url"] = target_url
-        target_profile["recon_data"] = {
-            "directories": recon_results["directories"][:50],
-            "homepage_info": recon_results["homepage_info"],
+        # Step 4: 组装黑板 — 端点来自工具, 策略来自 LLM
+        bb.target_profile = {
+            "base_url": target_url,
+            "tech_stack": decision.get("tech_stack", []),
+            "framework": decision.get("framework", ""),
+            "server": decision.get("server", ""),
+            "waf": decision.get("waf", ""),
+            "recon_data": {
+                "directories": recon_results["directories"][:50],
+                "homepage_info": recon_results["homepage_info"],
+            },
         }
-        bb.target_profile = target_profile
 
-        attack_surface = decision.get("attack_surface", {})
-        existing_endpoints = attack_surface.get("endpoints", [])
-        tool_endpoints = [{"path": d, "source": "dir_scan"} for d in recon_results["directories"][:20]]
-        # 添加带参数的端点（高价值目标）
-        param_endpoints = [
-            {"path": p["url"], "params": [p["name"]], "source": "crawl"}
-            for p in recon_results.get("parameters", [])[:30]
-        ]
-        # 添加表单端点
-        form_endpoints = [
-            {"path": f["action"], "method": f["method"], "params": f["params"], "source": "form"}
-            for f in recon_results.get("forms", [])[:15]
-            if f.get("action")
-        ]
-        attack_surface["endpoints"] = existing_endpoints + tool_endpoints + param_endpoints + form_endpoints
-        attack_surface["parameters"] = recon_results.get("parameters", [])[:50]
-        attack_surface["forms"] = recon_results.get("forms", [])[:20]
-        bb.attack_surface = attack_surface
-
+        bb.attack_surface = {
+            "endpoints": surface.endpoints,  # ← 来自工具, 非 LLM
+            "parameters": surface.parameters,
+            "forms": surface.forms,
+        }
+        bb.focus_vuln_types = decision.get("focus_vuln_types", [])
         bb.slot_status["target_profile"] = SlotStatus.READY
         bb.slot_status["attack_surface"] = SlotStatus.READY
         bb.version += 1
 
         profiled_data = {
-            "target_profile": bb.target_profile,
-            "attack_surface_endpoints": len(attack_surface.get("endpoints", [])),
+            "attack_surface_endpoints": len(surface.endpoints),
+            "vuln_pages": surface.vuln_pages,
+            "auth_pages": surface.auth_pages,
             "strategy": decision.get("strategy", "comprehensive_scan"),
+            "focus_vuln_types": decision.get("focus_vuln_types", []),
             "next_action": "hypothesize",
         }
         await emit(task_id, "orchestrator", "target_profiled", profiled_data)
@@ -518,9 +736,9 @@ async def orchestrator_node(state: VulnHuntState) -> dict:
         })
 
         logger.info(
-            "目标画像创建完成 (基于工具侦察), 策略: %s, 攻击面端点: %d",
+            "目标画像创建完成 (工具驱动攻击面): 策略=%s, 攻击面=%d端点 (%dvuln/%dauth)",
             decision.get("strategy"),
-            len(attack_surface.get("endpoints", [])),
+            len(surface.endpoints), surface.vuln_pages, surface.auth_pages,
         )
 
         await emit(task_id, "orchestrator", "agent_stopped", {"node": "orchestrator"})

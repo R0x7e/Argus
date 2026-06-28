@@ -231,11 +231,24 @@ class DiscoveryExtractor:
                 ))
 
         # 6. v2-fix: 从 new_facts 中提取发现 (补充字符串匹配盲区)
+        # P4: 修复列表格式解析 — 将 "发现 200 个 URL: [...]" 拆分为独立 Discovery
         for fact in getattr(result, 'new_facts', []) or []:
             if not isinstance(fact, str):
                 continue
             fact_lower = fact.lower()
-            # v16: 扩展关键词覆盖 — URL/端点/参数/漏洞信号/技术栈/WAF
+
+            # P4: 先尝试解析列表格式 (e.g., "发现 200 个 URL: ['http://...', ...]")
+            urls_from_list = self._parse_url_list(fact)
+            if urls_from_list:
+                for url in urls_from_list[:10]:  # 最多10个避免膨胀
+                    discoveries.append(Discovery(
+                        discovery_type=DiscoveryType.NEW_ENDPOINT,
+                        source_node_id=node.id, source_cycle=cycle,
+                        data={"url": url, "source": "new_facts_parsed"}, confidence=0.4,
+                    ))
+                continue  # 已处理此 fact, 跳过后续文本匹配
+
+            # 原有文本匹配逻辑
             if any(kw in fact_lower for kw in ("发现", "found", "端点", "endpoint", "链接", "link", "url", "api", "路径", "path")):
                 discoveries.append(Discovery(discovery_type=DiscoveryType.NEW_ENDPOINT,
                     source_node_id=node.id, source_cycle=cycle,
@@ -244,7 +257,6 @@ class DiscoveryExtractor:
                 discoveries.append(Discovery(discovery_type=DiscoveryType.NEW_PARAM,
                     source_node_id=node.id, source_cycle=cycle,
                     data={"param_name": fact[:200], "endpoint": node.state.current_endpoint}, confidence=0.4))
-            # v16: 漏洞信号/技术栈/WAF 检测
             if any(kw in fact_lower for kw in ("反射", "reflected", "payload", "确认", "confirmed")):
                 discoveries.append(Discovery(discovery_type=DiscoveryType.VULN_TYPE_CLUE,
                     source_node_id=node.id, source_cycle=cycle,
@@ -257,7 +269,6 @@ class DiscoveryExtractor:
                 discoveries.append(Discovery(discovery_type=DiscoveryType.WAF_BYPASS_FOUND,
                     source_node_id=node.id, source_cycle=cycle,
                     data={"observation": fact[:200], "action": "from_new_facts"}, confidence=0.5))
-
         # 7. v2-fix: run_poc 结果特殊处理
         for step in getattr(result, 'steps', []):
             action = getattr(step, 'action', '') or ''
@@ -440,19 +451,49 @@ class DiscoveryExtractor:
     @staticmethod
     def _is_vuln_clue(observation: str) -> bool:
         """检测是否暗示特定漏洞类型"""
+        obs_lower = observation.lower()
         vuln_clue_map = {
             "time_anomaly": "sql_injection",
             "reflected": "xss",
             "redirect": "open_redirect",
-            "internal address": "ssrf",
-            "file content": "lfi",
-            "config leak": "info_disclosure",
+            "error": "info_disclosure",
+            "upload": "file_upload",
+            "syntax error": "sql_injection",
         }
-        obs_lower = observation.lower()
-        for clue, vuln_type in vuln_clue_map.items():
-            if clue in obs_lower:
-                return True
-        return False
+        return any(clue in obs_lower for clue in vuln_clue_map)
+
+    def _parse_url_list(self, fact: str) -> list[str]:
+        """P4: 从 fact 字符串中解析 URL 列表
+
+        Handles formats like:
+        - "发现 200 个 URL: ['http://...', 'https://...', ...]"
+        - "深度爬取发现 200 个 URL: [...]"
+        - "发现 89 个链接: ['assets/css/...', ...]"
+        """
+        import ast
+        urls = []
+
+        # 尝试匹配 Python 列表字面量 [...]
+        match = re.search(r'\[([^\]]*(?:\[[^\]]*\][^\]]*)*)\]', fact)
+        if match:
+            try:
+                items = ast.literal_eval('[' + match.group(1) + ']')
+                for item in items:
+                    if isinstance(item, str) and len(item) > 1:
+                        # 跳过非 URL 文本 (纯描述性文字)
+                        if item.startswith(('http', '/')) or '.' in item:
+                            urls.append(item)
+            except (ValueError, SyntaxError):
+                pass
+
+        # 回退: 直接正则提取 URL
+        if not urls:
+            url_matches = re.findall(r'https?://[^\s,\'"\]]+', fact)
+            urls = url_matches
+
+        # 过滤静态资源
+        static_pattern = re.compile(r'\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot)(\?|#|$)', re.I)
+        return [u for u in urls if not static_pattern.search(u)][:20]
 
 
 # ──── 扩展引擎 ────
@@ -714,16 +755,20 @@ class ExpansionEngine:
         self, tree: SearchTree, parent: SearchNode,
         discovery: Discovery, cycle: int, base_url: str,
     ) -> list[SearchNode]:
-        """为新端点创建探索分支"""
+        """v2: 为新端点创建探索分支 (capability 门控)"""
         created = []
         url = discovery.data.get("url", "")
         if not url:
             return created
 
-        # P1-1: 验证 URL 是有效的路径（以 / 开头或包含域名）
-        # 如果 URL 无效（如包含非 URL 文本），跳过创建
-        if not (url.startswith("/") or "http" in url):
-            logger.warning("跳过无效的端点 URL: %s", url[:100])
+        # P5: 标准化端点路径
+        from app.agents.lats.endpoint_normalizer import normalize_endpoint_path
+        url = normalize_endpoint_path(url)
+        if url is None:
+            return created  # 拒绝垃圾路径
+
+        import re as _re_url
+        if _re_url.search(r'\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|pdf)(\?|#|$)', url, re.I):
             return created
 
         from urllib.parse import urlparse, parse_qs
@@ -733,27 +778,45 @@ class ExpansionEngine:
         try:
             parsed = urlparse(url)
             path = parsed.path or url
+            if not path.startswith("/"):
+                path = "/" + path
             if parsed.query:
                 qs = parse_qs(parsed.query)
                 params = list(qs.keys())
         except Exception:
-            pass
+            path = url if url.startswith("/") else "/" + url
 
-        from .reward import infer_vuln_types
-
-        for vuln_type in infer_vuln_types("", endpoint=path)[:3]:
-            child = tree.create_child_node(
-                parent=parent,
-                action="explore",
-                action_params={"endpoint": path, "vuln_type": vuln_type},
-                vuln_type=vuln_type,
-                endpoint=path,
-                param=params[0] if params else None,
-                value_estimate=0.4,  # 动态创建的节点先验保守一些
-                created_at_cycle=cycle,
+        # v2: 端点能力门控 — 获取 capability 并过滤
+        try:
+            from app.agents.lats.endpoint_capability import (
+                get_endpoint_capability_sync, is_vuln_type_compatible,
+                estimate_branch_value_v2, cache_capability, get_cached_capability,
             )
-            child.status = NodeStatus.SEED
-            created.append(child)
+            cap = get_cached_capability(base_url, path)
+            if not cap:
+                cap = get_endpoint_capability_sync(path, base_url)
+                cache_capability(base_url, path, cap)
+
+            allowed = cap.allowed_vuln_types
+            if allowed is not None and len(allowed) == 0:
+                return created  # 禁止所有类型
+
+            for vuln_type in (allowed or ["info_disclosure", "auth_bypass", "xss", "sql_injection"])[:3]:
+                if not is_vuln_type_compatible(vuln_type, cap):
+                    continue
+                value = estimate_branch_value_v2(vuln_type, params[0] if params else "", cap, "crawl")
+                child = tree.create_child_node(
+                    parent=parent, action="explore",
+                    action_params={"endpoint": path, "vuln_type": vuln_type},
+                    vuln_type=vuln_type, endpoint=path,
+                    param=params[0] if params else None,
+                    value_estimate=value, created_at_cycle=cycle,
+                )
+                child.status = NodeStatus.SEED
+                child.endpoint_metadata = cap.to_metadata()
+                created.append(child)
+        except ImportError:
+            pass  # 向后兼容
 
         return created
 

@@ -132,6 +132,17 @@ class SharedKnowledge:
         # ── v22: 成功请求向量 (跨Agent知识共享) ──
         self.successful_vectors: dict[str, list[SuccessfulRequestVector]] = {}  # endpoint → vectors
 
+        # ── P2: 端点步数追踪 ──
+        self.endpoint_step_counts: dict[str, int] = {}  # endpoint_path → step_count
+        self.endpoint_consecutive_dry: dict[str, int] = {}  # endpoint_path → consecutive_dry_steps
+        self.endpoint_max_steps: int = 12       # 单端点绝对上限
+        self.endpoint_max_ratio: float = 0.10   # 不超过总步数的 10%
+        self.endpoint_dry_step_cap: int = 3     # 连续无信息步数 → 截断
+
+        # ── v2: 端点×漏洞类型组合配额 ──
+        self.endpoint_vulntype_visits: dict[str, int] = {}  # "ep|vt" → count
+        self.max_visits_per_ep_vt: int = 3  # 同一组合最多3次完整ReAct
+
     # ──── 写入接口 ────
 
     async def record_endpoint(
@@ -462,3 +473,39 @@ class SharedKnowledge:
                 + "\n请优先使用上述参数/方法组合来测试你的payload。"
             )
         return ""
+
+    # ──── P2: 端点步数预算 ────
+
+    def record_endpoint_step(self, endpoint: str, had_new_info: bool = False) -> dict:
+        """记录一次端点步数，返回可否继续的判定"""
+        ep_key = endpoint or "/"
+        self.endpoint_step_counts[ep_key] = self.endpoint_step_counts.get(ep_key, 0) + 1
+        steps = self.endpoint_step_counts[ep_key]
+
+        if not had_new_info:
+            self.endpoint_consecutive_dry[ep_key] = self.endpoint_consecutive_dry.get(ep_key, 0) + 1
+        else:
+            self.endpoint_consecutive_dry[ep_key] = 0
+
+        dry = self.endpoint_consecutive_dry.get(ep_key, 0)
+        total_steps = sum(self.endpoint_step_counts.values())
+        dynamic_cap = min(self.endpoint_max_steps, max(5, int(total_steps * self.endpoint_max_ratio)))
+
+        if steps >= self.endpoint_max_steps:
+            return {"can_continue": False, "reason": f"达到绝对上限({self.endpoint_max_steps})", "steps": steps, "dry": dry}
+        if steps >= dynamic_cap and steps > 5:
+            return {"can_continue": False, "reason": f"达到动态上限({dynamic_cap})", "steps": steps, "dry": dry}
+        if dry >= self.endpoint_dry_step_cap:
+            return {"can_continue": False, "reason": f"连续{dry}步无新信息", "steps": steps, "dry": dry}
+        return {"can_continue": True, "reason": "", "steps": steps, "dry": dry}
+
+    def check_endpoint_vulntype_quota(self, endpoint: str, vuln_type: str) -> bool:
+        """检查 endpoint×vuln_type 组合是否还有配额"""
+        key = f"{endpoint}|{vuln_type}"
+        visits = self.endpoint_vulntype_visits.get(key, 0)
+        return visits < self.max_visits_per_ep_vt
+
+    def record_endpoint_vulntype_visit(self, endpoint: str, vuln_type: str) -> None:
+        """记录一次 endpoint×vuln_type 访问"""
+        key = f"{endpoint}|{vuln_type}"
+        self.endpoint_vulntype_visits[key] = self.endpoint_vulntype_visits.get(key, 0) + 1

@@ -109,7 +109,7 @@ def create_initial_state(
     # 仅在 task_config 提供了 base_url 时预填，否则让 orchestrator 做完整画像
     base_url = task_config.get("target_url") or task_config.get("base_url", "")
     if base_url:
-        bb.target_profile = {}  # 留空让 orchestrator 通过工具填充
+        bb.target_profile = {"base_url": base_url}
 
     initial_state: VulnHuntState = {
         "blackboard": bb,

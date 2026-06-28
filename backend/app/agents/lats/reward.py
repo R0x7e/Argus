@@ -6,6 +6,7 @@ LATS 奖励函数
 这让 MCTS 能有效地将搜索预算分配到最有价值的方向。
 """
 
+from typing import Any
 from .actions import Observation
 
 
@@ -94,6 +95,7 @@ def estimate_branch_value(
     source: str = "",
     focus_vuln_types: list[str] | None = None,
 ) -> float:
+    """:deprecated: 使用 estimate_branch_value_v2 替代。保留用于向后兼容。"""
     """
     初始价值评估（先验）
 
@@ -159,12 +161,16 @@ def estimate_branch_value(
 
     return min(1.0, base)
 
-
-def infer_vuln_types(param_name: str, endpoint: dict | str, tech_stack: list[str] | None = None) -> list[str]:
+def infer_vuln_types(
+    param_name: str,
+    endpoint: dict | str,
+    tech_stack: list[str] | None = None,
+    capability: Any = None,  # EndpointCapability | None
+) -> list[str]:
     """
-    基于参数名和端点特征推断可能的漏洞类型
+    基于参数名和端点特征推断可能的漏洞类型 (v2: 集成 EndpointCapability)。
 
-    用于搜索树初始化 — 每个 (endpoint, param, vuln_type) 组合创建一个初始分支
+    当 capability 提供时，结果会被 capability.allowed_vuln_types 过滤。
     """
     types = []
     p = (param_name or "").lower()
@@ -186,6 +192,10 @@ def infer_vuln_types(param_name: str, endpoint: dict | str, tech_stack: list[str
         types.append("rce")
     if p in ("template", "content", "message", "text"):
         types.append("ssti")
+    # P4: upload params
+    if p in ("file", "upload", "image", "avatar"):
+        if "file_upload" not in types:
+            types.append("file_upload")
 
     # 端点路径暗示
     if "admin" in path or "manage" in path:
@@ -199,6 +209,11 @@ def infer_vuln_types(param_name: str, endpoint: dict | str, tech_stack: list[str
     # 默认
     if not types:
         types = ["xss", "sql_injection"]
+
+    # v2: 应用 EndpointCapability 过滤
+    if capability is not None:
+        from app.agents.lats.endpoint_capability import is_vuln_type_compatible
+        types = [vt for vt in types if is_vuln_type_compatible(vt, capability)]
 
     # 去重
     return list(dict.fromkeys(types))

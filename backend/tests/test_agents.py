@@ -69,7 +69,7 @@ class TestRouting:
             "events": [],
         }
         result = route_from_orchestrator(state)
-        assert result == "__end__"
+        assert result == "reporter"
 
     def test_route_to_hypothesizer(self):
         state: VulnHuntState = {
@@ -93,7 +93,7 @@ class TestRouting:
             "events": [],
         }
         result = route_from_orchestrator(state)
-        assert result == "__end__"
+        assert result == "reporter"
 
 
 class TestInitialState:
@@ -116,7 +116,7 @@ class TestInitialState:
 
     def test_default_max_iterations(self):
         state = create_initial_state("task-002", {})
-        assert state["max_iterations"] == 3
+        assert state["max_iterations"] == 8
 
 
 class TestTokenBudget:

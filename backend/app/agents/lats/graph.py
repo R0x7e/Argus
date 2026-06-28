@@ -24,12 +24,18 @@ from langgraph.graph import END, StateGraph
 from app.agents.emit import emit
 from app.agents.llm import LLMClient
 from app.agents.lats.expansion_engine import ExpansionEngine, Discovery, DiscoveryType
+from app.agents.lats.node_resurrection import NodeResurrectionEngine
 from app.agents.lats.multi_level_prober import BatchProber, QuickProber
 from app.agents.lats.react_executor import ReactExecutorPool, ReactResult
 from app.agents.lats.reward import compute_reward, estimate_branch_value, infer_vuln_types
 from app.agents.lats.search_tree import NodeState, NodeStatus, SearchNode, SearchTree
+from app.agents.lats.endpoint_capability import (
+    EndpointCapability, get_endpoint_capability_sync, estimate_branch_value_v2,
+    is_vuln_type_compatible, get_compatible_vuln_types,
+)
 from app.agents.lats.shared_knowledge import SharedKnowledge
 from app.agents.state import Blackboard, VulnFinding
+from app.agents.token_budget import BudgetTier, TieredBudgetManager
 from app.tools.base import ExecutionContext
 
 logger = logging.getLogger(__name__)
@@ -129,6 +135,72 @@ async def lats_recon_node(state: dict) -> dict:
     })
 
     llm = _get_llm_client(task_id)
+
+    # [v3] 深层页面内容提取 — 使用策略模式自动检测网站类型
+    page_contents: list[dict] = []
+    try:
+        import httpx
+        from app.core.page_content_extractor import PageContentExtractor
+
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(target_url)
+            extractor = PageContentExtractor(max_depth=2, max_pages=20)
+            extracted = await extractor.extract(target_url, resp)
+            page_contents = [
+                {
+                    "url": pc.url,
+                    "status_code": pc.status_code,
+                    "page_type": pc.page_type,
+                    "title": pc.title,
+                    "forms": [
+                        {"action": f.action, "method": f.method,
+                         "params": f.params, "form_type": f.form_type}
+                        for f in pc.forms
+                    ],
+                    "input_params": pc.input_params,
+                    "js_endpoints": pc.js_endpoints,
+                    "links": pc.links[:30],
+                    "tech_fingerprint": pc.tech_fingerprint,
+                }
+                for pc in extracted
+            ]
+
+            # 将提取的表单参数合并到 recon_results
+            for pc in extracted:
+                for form in pc.forms:
+                    if form.params:
+                        recon_results.setdefault("forms", [])
+                        recon_results["forms"].append({
+                            "action": pc.url,
+                            "method": form.method,
+                            "params": form.params,
+                            "source": "page_extraction",
+                            "form_type": form.form_type,
+                        })
+                    for pname in form.params:
+                        recon_results.setdefault("parameters", [])
+                        if not any(
+                            isinstance(p, dict) and p.get("name") == pname
+                            for p in recon_results["parameters"]
+                        ):
+                            recon_results["parameters"].append({
+                                "name": pname,
+                                "url": pc.url,
+                                "source": "page_extraction",
+                            })
+                for ep in pc.js_endpoints[:20]:
+                    recon_results.setdefault("crawled_pages", [])
+                    if ep not in recon_results["crawled_pages"]:
+                        recon_results["crawled_pages"].append(ep)
+
+            logger.info(
+                "PageContentExtractor: 提取了 %d 个页面, %d 个表单, %d 个参数",
+                len(extracted),
+                sum(len(pc.forms) for pc in extracted),
+                sum(len(pc.input_params) for pc in extracted),
+            )
+    except Exception as e:
+        logger.warning("PageContentExtractor 提取失败 (非致命): %s", e)
     messages = [
         {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT},
         {"role": "user", "content": (
@@ -215,8 +287,13 @@ async def lats_recon_node(state: dict) -> dict:
 # ──── v5: URL 语义解析 — 从 URL 路径推断参数和漏洞类型 ────
 
 def _infer_vuln_from_path(path: str) -> list[str]:
-    """从 URL 路径名推断可能的漏洞类型，不依赖参数发现"""
+    """从 URL 路径名推断可能的漏洞类型，不依赖参数发现 (P6: 配置路径约束)"""
     path_lower = path.lower()
+
+    # P6: 配置/版本控制路径 → 仅 info_disclosure
+    if _is_config_path(path):
+        return ["info_disclosure"]
+
     types = []
     kw_map = {
         "sqli": "sql_injection", "sql": "sql_injection",
@@ -252,6 +329,128 @@ def _is_endpoint_injectable(path: str) -> bool:
     if any(s in path_lower for s in static_names):
         return False
     return True
+
+
+# ──── P6: 配置路径精确约束 ────
+_CONFIG_PATH_PATTERNS_V2 = (
+    '.git/', '.gitconfig', '.gitignore', '.env', '.svn/', '.hg/', '.bzr/',
+    'dockerfile', 'docker-compose', '.htaccess', '.htpasswd',
+    'robots.txt', 'sitemap', 'composer.lock', 'package-lock',
+    'yarn.lock', 'Gemfile.lock', 'Pipfile.lock', '.DS_Store',
+    'web.config', 'web.xml', 'server.xml', 'thumbs.db',
+    '.project', '.classpath', '.settings/', 'backup/', 'dump/',
+    'phpinfo', 'info.php', 'test.php', 'readme', 'changelog',
+    'license', 'copying',
+)
+
+
+def _is_config_path(path: str) -> bool:
+    """P6: 判断是否为配置/静态文件路径 (仅允许 info_disclosure)"""
+    path_lower = path.lower()
+    return any(p in path_lower for p in _CONFIG_PATH_PATTERNS_V2)
+
+
+# ──── P1: 端点预验证 ────
+
+# 端点可访问性枚举
+_ENDPOINT_ACCESSIBILITY: dict[int, str] = {
+    200: "accessible",
+    301: "redirect", 302: "redirect", 303: "redirect", 307: "redirect", 308: "redirect",
+    401: "auth_required",
+    403: "forbidden",
+    404: "not_found",
+    500: "server_error", 502: "server_error", 503: "server_error",
+}
+
+# 可访问性 → 允许的漏洞类型
+_ACCESSIBILITY_VULN_TYPES: dict[str, list[str]] = {
+    "accessible": [],   # 空列表 = 允许全部
+    "redirect": ["open_redirect"],
+    "auth_required": ["auth_bypass"],
+    "forbidden": [],     # 空列表 = 不测试
+    "not_found": [],     # 空列表 = 不测试
+    "server_error": ["info_disclosure"],
+    "timeout": [],
+    "unknown": [],
+}
+
+# 可访问性 MCTS 权重
+_ACCESSIBILITY_MCTS_WEIGHT: dict[str, float] = {
+    "accessible": 1.0,
+    "redirect": 0.7,
+    "auth_required": 0.5,
+    "server_error": 0.3,
+    "forbidden": 0.0,
+    "not_found": 0.0,
+    "timeout": 0.0,
+    "unknown": 0.3,
+}
+
+
+async def _prevalidate_endpoint(
+    path: str,
+    base_url: str,
+    timeout: float = 5.0,
+) -> dict:
+    """P1: 端点预验证 — GET 探测并分类可访问性
+
+    Returns:
+        {"accessibility": str, "status": int, "response_time_ms": int,
+         "content_type": str, "has_forms": bool, "is_config_path": bool}
+    """
+    import httpx
+    full_url = base_url.rstrip("/") + "/" + path.lstrip("/")
+    result = {
+        "accessibility": "unknown",
+        "status": 0,
+        "response_time_ms": 0,
+        "content_type": "",
+        "has_forms": False,
+        "is_config_path": _is_config_path(path),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+            import time as _time
+            start = _time.monotonic()
+            resp = await client.get(full_url)
+            elapsed_ms = int((_time.monotonic() - start) * 1000)
+            result["status"] = resp.status_code
+            result["response_time_ms"] = elapsed_ms
+            result["content_type"] = resp.headers.get("content-type", "")
+            result["accessibility"] = _ENDPOINT_ACCESSIBILITY.get(
+                resp.status_code, "unknown"
+            )
+            # 检测是否含表单
+            if resp.status_code == 200 and "text/html" in (resp.headers.get("content-type", "")):
+                import re as _re
+                result["has_forms"] = bool(_re.search(r'<form[\s>]', resp.text, _re.I))
+    except Exception:
+        result["accessibility"] = "timeout"
+    return result
+
+
+def _get_allowed_vuln_types(
+    accessibility: str,
+    is_config_path: bool,
+    path: str = "",
+) -> list[str] | None:
+    """P1: 根据端点可访问性返回允许的漏洞类型列表 (None = 全部允许)"""
+    # 配置路径: 仅 info_disclosure
+    if is_config_path:
+        return ["info_disclosure"]
+    # forbidden/not_found/timeout: 空列表 = 禁止所有
+    if accessibility in ("forbidden", "not_found", "timeout"):
+        return []
+    # 其余按可访问性限定
+    allowed = _ACCESSIBILITY_VULN_TYPES.get(accessibility)
+    if allowed is not None and len(allowed) == 0 and accessibility == "accessible":
+        return None  # accessible → 无限制
+    return allowed  # None 表示允许全部, [] 表示不允许
+
+
+def _get_accessibility_mcts_weight(accessibility: str) -> float:
+    """P1: 获取端点可访问性对应的 MCTS 选择权重"""
+    return _ACCESSIBILITY_MCTS_WEIGHT.get(accessibility, 0.3)
 
 
 def _infer_params_from_url(url: str) -> list[dict]:
@@ -440,9 +639,35 @@ async def lats_init_tree_node(state: dict) -> dict:
     scan_mode = "single_page" if is_single_page else "full_site"
     logger.info("init_tree scan_mode=%s target=%s", scan_mode, target_url)
 
+    # P1: 批量端点预验证 (仅 full_site 模式)
+    endpoint_meta_cache: dict[str, dict] = {}
+    if scan_mode == "full_site":
+        endpoints_raw = attack_surface.get("endpoints", [])
+        paths_to_validate = set()
+        for ep in endpoints_raw:
+            path = ep if isinstance(ep, str) else ep.get("path", "")
+            if path and path not in paths_to_validate:
+                paths_to_validate.add(path)
+        # 限制预验证数量
+        paths_list = list(paths_to_validate)[:30]
+        if paths_list:
+            logger.info("P1: 预验证 %d 个端点...", len(paths_list))
+            import asyncio as _asyncio_pre
+            tasks = [_prevalidate_endpoint(p, target_url) for p in paths_list]
+            results = await _asyncio_pre.gather(*tasks, return_exceptions=True)
+            for path, result in zip(paths_list, results):
+                if isinstance(result, dict):
+                    endpoint_meta_cache[path] = result
+                else:
+                    endpoint_meta_cache[path] = {"accessibility": "timeout", "status": 0}
+            accessible = sum(1 for m in endpoint_meta_cache.values() if m.get("accessibility") == "accessible")
+            forbidden = sum(1 for m in endpoint_meta_cache.values() if m.get("accessibility") in ("forbidden", "not_found"))
+            logger.info("P1: 预验证完成: accessible=%d, forbidden/404=%d, total=%d",
+                        accessible, forbidden, len(results))
+
     await emit(task_id, "lats_init", "agent_started", {"node": "init_tree", "scan_mode": scan_mode})
 
-    # v21: HDE 探索模式选择
+    # v21: HDE 探索模式 — 从 state 读取
     exploration_mode = state.get("exploration_mode", "tree")
     if exploration_mode == "endpoint":
         return await _init_endpoint_contexts(state, bb, task_id, task_config,
@@ -507,18 +732,53 @@ async def lats_init_tree_node(state: dict) -> dict:
         path = endpoint.get("path", "")
         params = endpoint.get("params", [])
         source = endpoint.get("source", "")
-
         if not path:
             continue
 
+        # NEW: 入口处标准化 — 拒绝 LLM 幻觉路径
+        from app.agents.lats.endpoint_normalizer import normalize_endpoint_path
+        clean_path = normalize_endpoint_path(path)
+        if clean_path is None:
+            logger.warning("tree_init: 拒绝无效端点路径: %s", str(path)[:100])
+            continue
+        if clean_path != path:
+            logger.info("tree_init: 标准化端点路径: %s → %s", path, clean_path)
+            path = clean_path
+            endpoint["path"] = clean_path
+
+        # P1: 端点预验证过滤
+        meta = endpoint_meta_cache.get(path, {})
+        accessibility = meta.get("accessibility", "unknown")
+        is_config = meta.get("is_config_path", _is_config_path(path))
+        allowed_vulns = _get_allowed_vuln_types(accessibility, is_config, path)
+        # allowed_vulns 为 [] 表示完全跳过此端点
+        if allowed_vulns is not None and len(allowed_vulns) == 0:
+            logger.debug("P1: 跳过端点 %s (accessibility=%s)", path, accessibility)
+            continue
+
+        # P1: 默认的 endpoint_metadata
+        default_meta = {"accessibility": accessibility, "is_config_path": is_config,
+                        "status": meta.get("status", 0)}
+
         if not params:
-            for vtype in ["info_disclosure", "auth_bypass"]:
+            default_vulns = ["info_disclosure", "auth_bypass"]
+            # P1: 如果有 allowed_vulns 且不为 None, 过滤
+            if allowed_vulns is not None:
+                default_vulns = [vt for vt in default_vulns if vt in allowed_vulns]
+            if not default_vulns:
+                continue
+            for vtype in default_vulns:
                 branch_key = f"{vtype}@{path}"
                 if branch_key in seen_branches:
                     continue
                 seen_branches.add(branch_key)
-                value = estimate_branch_value(vtype, "", path, tech_stack, source, focus_vuln_types=focus_vuln_types)
-                value += _random.uniform(-0.05, 0.05)  # v5: 打破同质化
+                # v2: 使用 capability 感知的估值
+                cap = get_endpoint_capability_sync(path, target_url) if target_url else None
+                if cap:
+                    value = estimate_branch_value_v2(vtype, "", cap, source, focus_vuln_types)
+                else:
+                    value = estimate_branch_value(vtype, "", path, tech_stack, source, focus_vuln_types)
+                value += _random.uniform(-0.05, 0.05)
                 value = max(0.05, min(1.0, value))
                 child = tree.create_child_node(
                     parent=root, action="explore",
@@ -526,23 +786,34 @@ async def lats_init_tree_node(state: dict) -> dict:
                     vuln_type=vtype, endpoint=path, param=None,
                     value_estimate=value, created_at_cycle=0,
                 )
-                child.status = NodeStatus.SEED  # v2
+                child.status = NodeStatus.SEED
+                child.endpoint_metadata = dict(default_meta)
                 branches_created += 1
 
         for param in params:
             param_name = param if isinstance(param, str) else param.get("name", "")
             vuln_types = infer_vuln_types(param_name, endpoint, tech_stack)
-            # v21: 端点路径语义过滤 — 路径明确时仅创建匹配类型分支
+            # P1: 应用预验证约束
+            if allowed_vulns is not None:
+                vuln_types = [vt for vt in vuln_types if vt in allowed_vulns]
+            # v21: 端点路径语义过滤
             path_hints = _infer_vuln_from_path(path) if path else []
             if path_hints and path_hints != ["info_disclosure", "auth_bypass"]:
                 vuln_types = [vt for vt in vuln_types if vt in path_hints] or vuln_types[:1]
+            if not vuln_types:
+                continue
             for vtype in vuln_types:
                 branch_key = f"{vtype}@{path}:{param_name}"
                 if branch_key in seen_branches:
                     continue
                 seen_branches.add(branch_key)
-                value = estimate_branch_value(vtype, param_name, path, tech_stack, source, focus_vuln_types=focus_vuln_types)
-                value += _random.uniform(-0.05, 0.05)  # v5: 打破同质化
+                # v2: 使用 capability 感知的估值
+                cap = get_endpoint_capability_sync(path, target_url) if target_url else None
+                if cap:
+                    value = estimate_branch_value_v2(vtype, param_name, cap, source, focus_vuln_types)
+                else:
+                    value = estimate_branch_value(vtype, param_name, path, tech_stack, source, focus_vuln_types)
+                value += _random.uniform(-0.05, 0.05)
                 value = max(0.05, min(1.0, value))
                 child = tree.create_child_node(
                     parent=root, action="explore",
@@ -550,8 +821,9 @@ async def lats_init_tree_node(state: dict) -> dict:
                     vuln_type=vtype, endpoint=path, param=param_name,
                     value_estimate=value, created_at_cycle=0,
                 )
-                child.status = NodeStatus.SEED  # v2
-                branches_created += 1 
+                child.status = NodeStatus.SEED
+                child.endpoint_metadata = dict(default_meta)
+                branches_created += 1
 
     # v5: 为 URL 推断参数创建分支 (打破 auth_bypass 垄断)
     for inferred in url_inferred_params:
@@ -565,7 +837,8 @@ async def lats_init_tree_node(state: dict) -> dict:
                 if branch_key in seen_branches:
                     continue
                 seen_branches.add(branch_key)
-                value = estimate_branch_value(vtype, pname, path, tech_stack, "url_inferred", focus_vuln_types=focus_vuln_types)
+                cap = get_endpoint_capability_sync(path, target_url) if target_url else None
+                value = estimate_branch_value_v2(vtype, pname, cap, "url_inferred", focus_vuln_types) if cap else estimate_branch_value(vtype, pname, path, tech_stack, "url_inferred", focus_vuln_types)
                 value += _random.uniform(-0.05, 0.05)  # v5: 随机抖动打破同质化
                 value = max(0.05, min(1.0, value))
                 child = tree.create_child_node(
@@ -609,8 +882,10 @@ async def lats_init_tree_node(state: dict) -> dict:
                 bk = f"{vt}@{path}:{fb_param}"
                 if bk in seen_branches:
                     continue
-                seen_branches.add(bk)
-                val = max(0.3, estimate_branch_value(vt, fb_param, path, tech_stack, "fallback", focus_vuln_types=focus_vuln_types) - 0.15)
+                cap = get_endpoint_capability_sync(path, target_url) if target_url else None
+                if cap and not is_vuln_type_compatible(vt, cap):
+                    continue  # v2: 不兼容 → 跳过
+                val = max(0.3, estimate_branch_value_v2(vt, fb_param, cap, "fallback", focus_vuln_types) if cap else estimate_branch_value(vt, fb_param, path, tech_stack, "fallback", focus_vuln_types) - 0.15)
                 val += _random.uniform(-0.03, 0.03)
                 child = tree.create_child_node(
                     parent=root, action="explore_fallback",
@@ -1049,6 +1324,17 @@ async def lats_expand_node(state: dict) -> dict:
         task_id=task_id,
     )
 
+
+    # 4. [v3] 节点复活: 检查 Graveyard 中是否有节点可以因新发现而复活
+    resurrection_engine = NodeResurrectionEngine(max_resurrections_per_cycle=3)
+    resurrected = resurrection_engine.check_resurrection(
+        tree=tree,
+        new_discoveries=unique_discoveries,
+        shared_knowledge=knowledge,
+        current_cycle=cycle,
+    )
+    if resurrected:
+        expansion_result["resurrected"] = expansion_result.get("resurrected", 0) + len(resurrected)
     tree_stats = tree.stats()
 
     await emit(task_id, "lats_expand", "expansion_complete", {

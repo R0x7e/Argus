@@ -6,6 +6,7 @@ LATS 动作空间定义和执行映射
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -491,15 +492,33 @@ def _detect_vuln_indicators(obs: Observation, payload: str, body: str, status: i
         obs.new_facts.append("SSRF 确认: file://协议读取")
         detected_type = "ssrf"
 
-    # Info Disclosure
-    sensitive_patterns = ["password", "secret", "api_key", "private_key", "AWS_SECRET",
-                          "DB_PASSWORD", "MYSQL_PASSWORD", "[core]", "repositoryformatversion"]
-    if status == 200 and len(body) > 50 and any(p.lower() in body_lower for p in sensitive_patterns):
-        obs.vuln_confirmed = True
-        obs.severity = "medium"
-        obs.finding = {"type": "info_disclosure", "evidence": "敏感信息泄露", "payload": payload}
-        obs.new_facts.append("信息泄露确认: 敏感数据出现在响应中")
-        detected_type = "info_disclosure"
+    # Info Disclosure (v2: 基于实际敏感内容证据)
+    _INFO_DISCLOSURE_STRONG = [
+        (r'\[core\]\s*\n\s*repositoryformatversion', "git_config_exposed"),
+        (r'ref:\s*refs/heads/', "git_head_exposed"),
+        (r'\[remote\s+"origin"\]', "git_remote_exposed"),
+        (r'(?:password|passwd|secret|api_key|private_key)\s*[:=]\s*[\'"]?\S+[\'"]?', "credential_leaked"),
+        (r'(?:AWS_|DB_|MYSQL_|POSTGRES_|REDIS_)(?:PASSWORD|SECRET|KEY)\s*=\s*', "env_credential_leaked"),
+    ]
+    if status == 200 and len(body) > 20:
+        for pattern, ev_type in _INFO_DISCLOSURE_STRONG:
+            if re.search(pattern, body, re.I):
+                obs.vuln_confirmed = True
+                obs.severity = "high"
+                obs.finding = {"type": "info_disclosure", "evidence": ev_type, "payload": payload}
+                obs.new_facts.append(f"信息泄露确认 ({ev_type}): 敏感数据出现在响应中")
+                detected_type = "info_disclosure"
+                break
+        # v2: 仅当端点本身是配置路径或版本控制路径时才提升弱信号
+        if not obs.vuln_confirmed and state is not None:
+            ep_path = (getattr(state, 'current_endpoint', '') or '').lower()
+            is_cfg_path = any(p in ep_path for p in ('.git/', '.env', 'dockerfile', '.htaccess', 'backup', 'config'))
+            if is_cfg_path and len(body) > 100:
+                obs.vuln_confirmed = True
+                obs.severity = "medium"
+                obs.finding = {"type": "info_disclosure", "evidence": "config_path_accessible", "payload": payload}
+                obs.new_facts.append("信息泄露确认: 配置路径可访问")
+                detected_type = "info_disclosure"
 
     # v5: 自动升级节点 vuln_type — Agent 发现了与节点类型不同的漏洞信号
     if detected_type and state is not None and hasattr(state, 'vuln_type'):
