@@ -152,6 +152,14 @@ def build_react_prompt(
         f"- 参数: {state_dict.get('current_param', 'N/A')}",
         f"- 漏洞类型: {state_dict.get('vuln_type', '')}",
     ]
+    # L2/PR-3: 告知 LLM 端点的 HTTP method 与表单字段 — POST-only 注入点
+    # 若不显式说明, LLM 默认用 GET 永远打不到 Pikachu 这种只认 POST 的端点。
+    _method = str(state_dict.get('http_method', '') or '').upper()
+    _ff = state_dict.get('form_fields', []) or []
+    if _method == "POST":
+        parts.append(f"- ⚠️ 端点 HTTP 方法: POST (必须用 method=POST, 不要用 GET)")
+        if _ff:
+            parts.append(f"- 表单字段集: {_ff} (POST 时 body 需包含这些字段, 命中参数填 payload, 其余填空)")
     # P2-2: 根据漏洞类型建议匹配的 preset
     vuln_type = state_dict.get('vuln_type', '')
     preset_map = {

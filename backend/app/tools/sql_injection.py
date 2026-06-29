@@ -165,6 +165,7 @@ class SQLInjectionTool(BaseTool):
         method = params.get("method", "GET").upper()
         headers = params.get("headers", {})
         auth_token = params.get("auth_token", "")
+        form_fields = params.get("form_fields") or []
 
         # 参数校验
         if not url:
@@ -259,6 +260,7 @@ class SQLInjectionTool(BaseTool):
         param: str,
         method: str,
         headers: dict,
+        form_fields: list[str] | None = None,
     ) -> dict:
         """
         基于错误的 SQL 注入检测
@@ -278,7 +280,7 @@ class SQLInjectionTool(BaseTool):
         for payload in ERROR_BASED_PAYLOADS:
             try:
                 response = await self._send_request(
-                    client, url, param, payload, method, headers
+                    client, url, param, payload, method, headers, form_fields=form_fields
                 )
                 response_text = response.text.lower()
 
@@ -314,6 +316,7 @@ class SQLInjectionTool(BaseTool):
         param: str,
         method: str,
         headers: dict,
+        form_fields: list[str] | None = None,
     ) -> dict:
         """
         基于时间的盲注 SQL 注入检测
@@ -336,14 +339,14 @@ class SQLInjectionTool(BaseTool):
                 # 发送基线请求（SLEEP(0)）
                 start = time.monotonic()
                 await self._send_request(
-                    client, url, param, payloads["baseline"], method, headers
+                    client, url, param, payloads["baseline"], method, headers, form_fields=form_fields
                 )
                 baseline_ms = int((time.monotonic() - start) * 1000)
 
                 # 发送注入请求（SLEEP(3)）
                 start = time.monotonic()
                 await self._send_request(
-                    client, url, param, payloads["inject"], method, headers
+                    client, url, param, payloads["inject"], method, headers, form_fields=form_fields
                 )
                 inject_ms = int((time.monotonic() - start) * 1000)
 
@@ -379,6 +382,7 @@ class SQLInjectionTool(BaseTool):
         param: str,
         method: str,
         headers: dict,
+        form_fields: list[str] | None = None,
     ) -> dict:
         """
         基于布尔条件的盲注 SQL 注入检测
@@ -406,7 +410,7 @@ class SQLInjectionTool(BaseTool):
 
                 # 发送 true 条件请求
                 true_response = await self._send_request(
-                    client, url, param, true_cond, method, headers
+                    client, url, param, true_cond, method, headers, form_fields=form_fields
                 )
                 true_body = true_response.text
                 true_len = len(true_body)
@@ -414,7 +418,7 @@ class SQLInjectionTool(BaseTool):
 
                 # 发送 false 条件请求
                 false_response = await self._send_request(
-                    client, url, param, false_cond, method, headers
+                    client, url, param, false_cond, method, headers, form_fields=form_fields
                 )
                 false_body = false_response.text
                 false_len = len(false_body)
@@ -460,6 +464,7 @@ class SQLInjectionTool(BaseTool):
         value: str,
         method: str,
         headers: dict,
+        form_fields: list[str] | None = None,
     ) -> httpx.Response:
         """
         发送带有注入参数的 HTTP 请求
@@ -471,6 +476,7 @@ class SQLInjectionTool(BaseTool):
             value: 参数值（注入载荷）
             method: HTTP 方法
             headers: 请求头
+            form_fields: 完整表单字段集 (POST 时重构 body, L2/PR-3)
 
         Returns:
             HTTP 响应对象
@@ -481,6 +487,14 @@ class SQLInjectionTool(BaseTool):
             full_url = f"{url}{separator}{param}={value}"
             return await client.get(full_url, headers=headers)
         else:
-            # POST 请求：参数放入请求体
-            data = {param: value}
+            # POST 请求：用完整表单字段重构 body, 命中参数填 value, 其余填空
+            data = {}
+            fields = list(form_fields) if form_fields else []
+            if param:
+                data[param] = value
+            for f in fields:
+                if f and f not in data:
+                    data[f] = ""
+            if not data and param:
+                data[param] = value
             return await client.post(url, data=data, headers=headers)

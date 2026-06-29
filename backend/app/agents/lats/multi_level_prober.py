@@ -8,12 +8,50 @@ Phase 3: Level 0 快速探测 — 3 次 HTTP 请求, 零 LLM 调用.
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlencode
 
 from app.tools.base import ExecutionContext
 
 logger = logging.getLogger(__name__)
+
+
+# ──── L2-fix: SQL 错误特征库 (error-based / 闭合检测确认信号) ────
+# 旧 _classify/probe_round2 只看 长度差/5xx/时延, 漏掉 200+MySQL 报错这种
+# 最常见的 error-based SQLi (Pikachu POST id=1' → 200 + "error in your SQL syntax")
+_SQL_ERROR_PATTERNS = [
+    r"you have an error in your sql syntax",
+    r"error in your sql syntax",
+    r"syntax error near ['`\"]",
+    r"mysql_fetch",
+    r"warning:\s*mysql",
+    r"mysqli?",
+    r"valid mysql result",
+    r"odbc (sql|driver)",
+    r"ora-\d{5}",
+    r"pg_(query|exec|send_query)",
+    r"sqlstate",
+    r"sqlite3?\.",
+    r"unclosed quotation mark",
+    r"near ['`\"][^'\"]*['`\"]:\s*line",
+]
+
+
+def _detect_error_signal(body: str) -> str | None:
+    """检测响应体中的 DB 错误字符串, 返回命中的模式描述 (None=未命中)"""
+    if not body:
+        return None
+    lower = body.lower()
+    for pat in _SQL_ERROR_PATTERNS:
+        m = re.search(pat, lower)
+        if m:
+            # 提取上下文证据片段 (60 字符)
+            idx = m.start()
+            snippet = body[max(0, idx - 20): idx + 80].replace("\n", " ").strip()
+            return f"SQL_ERROR[{pat}]: ...{snippet}..."
+    return None
 
 
 @dataclass
@@ -117,6 +155,23 @@ _VULN_TYPE_DIVERSE_PAYLOADS: dict[str, list[str]] = {
 }
 
 
+# ──── P1: 无参端点参数回退映射 ────
+_PARAM_FALLBACK_BY_VULN_TYPE: dict[str, list[str]] = {
+    "sql_injection": ["id", "q", "query", "search", "name", "username", "uid"],
+    "rce": ["cmd", "exec", "command", "ping", "ip", "host"],
+    "xss": ["q", "search", "name", "message", "comment", "input", "text"],
+    "lfi": ["file", "path", "page", "include", "filename"],
+    "path_traversal": ["file", "path", "dir", "folder", "download"],
+    "ssrf": ["url", "link", "callback", "redirect", "fetch"],
+    "ssti": ["template", "name", "message", "content", "text"],
+    "idor": ["id", "uid", "user_id", "account", "order_id", "profile_id"],
+    "open_redirect": ["url", "redirect", "next", "return", "goto"],
+    "auth_bypass": ["username", "password", "user", "pass", "token"],
+    "info_disclosure": [],
+    "file_upload": ["file", "image", "upload"],
+}
+
+
 class QuickProber:
     """
     Level 0 快速探测器
@@ -130,30 +185,16 @@ class QuickProber:
 
     async def probe(
         self,
-        node,  # SearchNode
+        node,
         context: ExecutionContext,
         base_url: str = "",
     ) -> ProbeResult:
-        """
-        执行 Level 0 探测
 
-        步骤:
-        1. 发送基线请求 (无注入, 不含探测参数)
-        2. 发送探测字符请求 (注入一个无害探测字符, 如 ')
-        3. 发送代表性 payload 请求 (根据 vuln_type 选一个代表性 payload)
-
-        Args:
-            node: SearchNode
-            context: ExecutionContext
-            base_url: 目标基础 URL
-
-        Returns:
-            ProbeResult (含 verdict: "promoted" | "killed")
-        """
         endpoint = self._build_url(node.state.current_endpoint, base_url)
         param = node.state.current_param
         vuln_type = node.state.vuln_type
-
+        # L2-fix: 读取节点的 HTTP method 与完整表单字段 (PR-3)
+        method, form_fields = self._node_probe_method(node)
         result = ProbeResult(
             node_id=node.id,
             endpoint=endpoint,
@@ -166,9 +207,38 @@ class QuickProber:
             result.error = "empty endpoint"
             return result
 
+        # P1: 无参端点 — 尝试参数回退, 不直接杀死
+        if not param and vuln_type in _PARAM_FALLBACK_BY_VULN_TYPE:
+            fallback_params = _PARAM_FALLBACK_BY_VULN_TYPE[vuln_type]
+            for fb_param in fallback_params[:2]:
+                probe_req = await self._send_request(endpoint, context, param=fb_param,
+                                                     payload="1", method=method,
+                                                     form_fields=form_fields)
+                if probe_req.get("success") and probe_req.get("status_code", 0) == 200:
+                    probe_body = probe_req.get("body", "") or ""
+                    # 检查是否与无参基线不同 (说明参数被处理了)
+                    baseline_no_param = await self._send_request(endpoint, context, param=None,
+                                                                 payload=None, method=method,
+                                                                 form_fields=form_fields)
+                    if probe_body != (baseline_no_param.get("body", "") or ""):
+                        param = fb_param
+                        node.state.current_param = fb_param
+                        # 回退发现参数时同步补进 form_fields, 供后续 POST 重构 body
+                        if fb_param and fb_param not in form_fields:
+                            form_fields = form_fields + [fb_param]
+                        logger.info("P1: 发现有效参数 %s → %s (method=%s)", endpoint, fb_param, method)
+                        break
+
+        # P1: 仍无参数 — 不杀死, 让 ReAct 自行发现
+        if not param:
+            result.verdict = "needs_deeper_probe"
+            result.error = "no_param_available"
+            return result
+
         try:
             # Step 1: 基线请求
-            baseline = await self._send_request(endpoint, context, param=None, payload=None)
+            baseline = await self._send_request(endpoint, context, param=None, payload=None,
+                                                method=method, form_fields=form_fields)
             result.baseline_status = baseline.get("status_code", 0)
             result.baseline_length = len(baseline.get("body", "") or "")
             result.baseline_time_ms = baseline.get("response_time_ms", 0)
@@ -187,7 +257,8 @@ class QuickProber:
 
             # Step 2: 探测字符
             probe_char = "'" if vuln_type in ("sql_injection", "xss", "ssti", "lfi") else "."
-            probe = await self._send_request(endpoint, context, param=param, payload=probe_char)
+            probe = await self._send_request(endpoint, context, param=param, payload=probe_char,
+                                             method=method, form_fields=form_fields)
             result.probe_status = probe.get("status_code", 0)
             result.probe_length = len(probe.get("body", "") or "")
             result.probe_time_ms = probe.get("response_time_ms", 0)
@@ -195,15 +266,27 @@ class QuickProber:
             if not probe.get("success"):
                 result.signals["probe_failed"] = True
 
+            # L2-fix: SQL 错误串检测 — probe_char (常用 '/') 触发 error-based 信号
+            probe_body = probe.get("body", "") or ""
+            err = _detect_error_signal(probe_body)
+            if err and vuln_type in ("sql_injection", "sql_injection_numeric", "xss", "ssti", "lfi"):
+                result.signals["sqli_error"] = err
+
             # Step 3: 代表性 payload
             probe_payload = _VULN_TYPE_PROBE_PAYLOAD.get(vuln_type, "test")
             if probe_payload:
-                inject = await self._send_request(endpoint, context, param=param, payload=probe_payload)
+                inject = await self._send_request(endpoint, context, param=param, payload=probe_payload,
+                                                  method=method, form_fields=form_fields)
                 result.inject_status = inject.get("status_code", 0)
                 result.inject_length = len(inject.get("body", "") or "")
                 result.inject_time_ms = inject.get("response_time_ms", 0)
                 result.signals["inject_body"] = inject.get("body", "") or ""
                 result.signals["baseline_body"] = baseline.get("body", "") or ""
+                # L2-fix: inject payload 也检测错误串
+                if "sqli_error" not in result.signals:
+                    err2 = _detect_error_signal(inject.get("body", "") or "")
+                    if err2:
+                        result.signals["sqli_error"] = err2
 
             # 分类判定
             result.verdict = self._classify(result)
@@ -252,6 +335,10 @@ class QuickProber:
                 return "promoted"
             if r.baseline_status == 200:
                 return "promoted"
+
+        # ── L2-fix: SQL 错误串 → 直接 promoted (error-based SQLi 确认信号) ──
+        if signals.get("sqli_error"):
+            return "promoted"
 
         # ── 状态码异常 (5xx) → promoted ──
         if r.inject_status >= 500 and r.baseline_status < 500:
@@ -310,6 +397,8 @@ class QuickProber:
         endpoint = self._build_url(node.state.current_endpoint, base_url)
         param = node.state.current_param
         vuln_type = node.state.vuln_type
+        # L2-fix: 沿用 Level0 节点的 method/form_fields
+        method, form_fields = self._node_probe_method(node)
 
         result = ProbeResult(
             node_id=node.id,
@@ -325,7 +414,8 @@ class QuickProber:
 
         try:
             # 基线请求
-            baseline = await self._send_request(endpoint, context, param=None, payload=None)
+            baseline = await self._send_request(endpoint, context, param=None, payload=None,
+                                                method=method, form_fields=form_fields)
             result.baseline_status = baseline.get("status_code", 0)
             result.baseline_length = len(baseline.get("body", "") or "")
             result.baseline_time_ms = baseline.get("response_time_ms", 0)
@@ -342,11 +432,20 @@ class QuickProber:
             for payload in diverse_payloads[:3]:
                 if not payload:
                     continue
-                inject = await self._send_request(endpoint, context, param=param, payload=payload)
+                inject = await self._send_request(endpoint, context, param=param, payload=payload,
+                                                   method=method, form_fields=form_fields)
                 inj_status = inject.get("status_code", 0)
                 inj_len = len(inject.get("body", "") or "")
                 inj_time = inject.get("response_time_ms", 0)
+                inj_body = inject.get("body", "") or ""
+                base_body = baseline.get("body", "") or ""
 
+                # L2-fix: SQL 错误串 — error-based SQLi 确认信号 (最高优先级)
+                err = _detect_error_signal(inj_body)
+                if err:
+                    result.signals["sqli_error"] = err
+                    had_signal = True
+                    break
                 # 检查任一信号
                 if inj_status >= 500:
                     had_signal = True
@@ -358,8 +457,6 @@ class QuickProber:
                     had_signal = True
                     break
                 # 内容指纹比较
-                inj_body = inject.get("body", "") or ""
-                base_body = baseline.get("body", "") or ""
                 if inj_body and base_body:
                     import re as _re2
                     if _re2.sub(r'\d+', '', base_body) != _re2.sub(r'\d+', '', inj_body):
@@ -394,13 +491,20 @@ class QuickProber:
         context: ExecutionContext,
         param: str | None = None,
         payload: str | None = None,
+        method: str = "GET",
+        form_fields: list[str] | None = None,
     ) -> dict:
-        """发送探测 HTTP 请求 (零 LLM, 纯 httpx)"""
+        """发送探测 HTTP 请求 (零 LLM, 纯 httpx)
+
+        L2-fix: 支持 POST + 用侦察到的完整表单字段重构 body
+        (旧实现只 GET, POST-only 形参端点永远打不到)。
+        """
         import httpx
 
         if not url:
             return {"success": False, "status_code": -1, "error": "empty url"}
 
+        method = (method or "GET").upper()
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(min(context.timeout, 10)),
@@ -410,12 +514,28 @@ class QuickProber:
                 import time
                 start = time.monotonic()
 
-                if param and payload:
-                    separator = "&" if "?" in url else "?"
-                    full_url = f"{url}{separator}{param}={payload}"
-                    resp = await client.get(full_url)
+                if method == "POST":
+                    # 用完整表单字段重构 body, 命中参数填 payload, 其余填空/默认
+                    fields = list(form_fields) if form_fields else ([param] if param else [])
+                    body_dict: dict[str, str] = {}
+                    if param and payload is not None:
+                        body_dict[param] = str(payload)
+                    # 补全其余必填字段 (空值), 避免后端校验拒收
+                    for f in fields:
+                        if f and f not in body_dict:
+                            body_dict[f] = ""
+                    post_body = urlencode(body_dict, doseq=True)
+                    resp = await client.post(
+                        url, content=post_body,
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    )
                 else:
-                    resp = await client.get(url)
+                    if param and payload is not None:
+                        separator = "&" if "?" in url else "?"
+                        full_url = f"{url}{separator}{param}={payload}"
+                        resp = await client.get(full_url)
+                    else:
+                        resp = await client.get(url)
 
                 elapsed_ms = int((time.monotonic() - start) * 1000)
                 body = resp.text[:50000] if resp.text else ""  # P2-5: 从 3000 提高到 50000
@@ -434,6 +554,13 @@ class QuickProber:
                 "error": str(e)[:200],
                 "response_time_ms": 0,
             }
+
+    def _node_probe_method(self, node) -> tuple[str, list[str]]:
+        """L2-fix: 从节点 endpoint_metadata 读取 http_method/form_fields"""
+        meta = getattr(node, "endpoint_metadata", {}) or {}
+        method = str(meta.get("http_method", "GET")).upper()
+        fields = list(meta.get("form_fields", []) or [])
+        return method, fields
 
 
 # ──── 批量探测器 ────

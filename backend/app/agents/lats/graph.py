@@ -13,6 +13,7 @@ v2 新增:
 
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Any, TypedDict
@@ -127,97 +128,167 @@ async def lats_recon_node(state: dict) -> dict:
 
     recon_results = await _run_reconnaissance(state)
 
-    await emit(task_id, "lats_recon", "recon_complete", {
-        "dirs_found": len(recon_results.get("directories", [])),
-        "pages_crawled": len(recon_results.get("crawled_pages", [])),
-        "params_found": len(recon_results.get("parameters", [])),
-        "forms_found": len(recon_results.get("forms", [])),
-    })
-
+    # L1-fix: recon_complete 移到 P2 多层提取之后, 避免事件统计恒为 0
     llm = _get_llm_client(task_id)
 
-    # [v3] 深层页面内容提取 — 使用策略模式自动检测网站类型
+
+    # P2: 多层参数提取 (PageContentExtractor → Playwright → Link query fallback)
     page_contents: list[dict] = []
     try:
         import httpx
         from app.core.page_content_extractor import PageContentExtractor
-
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             resp = await client.get(target_url)
             extractor = PageContentExtractor(max_depth=2, max_pages=20)
             extracted = await extractor.extract(target_url, resp)
-            page_contents = [
-                {
-                    "url": pc.url,
-                    "status_code": pc.status_code,
-                    "page_type": pc.page_type,
-                    "title": pc.title,
-                    "forms": [
-                        {"action": f.action, "method": f.method,
-                         "params": f.params, "form_type": f.form_type}
-                        for f in pc.forms
-                    ],
-                    "input_params": pc.input_params,
-                    "js_endpoints": pc.js_endpoints,
-                    "links": pc.links[:30],
-                    "tech_fingerprint": pc.tech_fingerprint,
-                }
-                for pc in extracted
-            ]
-
-            # 将提取的表单参数合并到 recon_results
             for pc in extracted:
                 for form in pc.forms:
                     if form.params:
                         recon_results.setdefault("forms", [])
                         recon_results["forms"].append({
-                            "action": pc.url,
-                            "method": form.method,
-                            "params": form.params,
+                            "action": pc.url, "method": form.method,
+                            "params": form.params, "form_fields": list(form.params),
                             "source": "page_extraction",
-                            "form_type": form.form_type,
                         })
                     for pname in form.params:
                         recon_results.setdefault("parameters", [])
-                        if not any(
-                            isinstance(p, dict) and p.get("name") == pname
-                            for p in recon_results["parameters"]
-                        ):
+                        if not any(isinstance(p, dict) and p.get("name") == pname
+                                   for p in recon_results["parameters"]):
                             recon_results["parameters"].append({
-                                "name": pname,
-                                "url": pc.url,
-                                "source": "page_extraction",
+                                "name": pname, "url": pc.url, "source": "page_extraction",
                             })
-                for ep in pc.js_endpoints[:20]:
-                    recon_results.setdefault("crawled_pages", [])
-                    if ep not in recon_results["crawled_pages"]:
-                        recon_results["crawled_pages"].append(ep)
-
-            logger.info(
-                "PageContentExtractor: 提取了 %d 个页面, %d 个表单, %d 个参数",
-                len(extracted),
-                sum(len(pc.forms) for pc in extracted),
-                sum(len(pc.input_params) for pc in extracted),
-            )
+            logger.info("PageContentExtractor: %d pages, %d forms, %d params",
+                        len(extracted), len(recon_results.get("forms", [])),
+                        len(recon_results.get("parameters", [])))
     except Exception as e:
-        logger.warning("PageContentExtractor 提取失败 (非致命): %s", e)
-    messages = [
+        logger.warning("PageContentExtractor 失败 (非致命): %s", e)
+
+    # P2 Layer2: Playwright 渲染提取表单 (PageContentExtractor 失败或表单少的回退)
+    if len(recon_results.get("forms", [])) < 2:
+        try:
+            from app.core.playwright_manager import get_browser
+            browser = get_browser()
+            bctx = await browser.new_context(ignore_https_errors=True)
+            page = await bctx.new_page()
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
+            pw_forms = await page.evaluate("""() => {
+                return [...document.querySelectorAll('form')].map(f => ({
+                    action: f.action || window.location.href,
+                    method: (f.method || 'GET').toUpperCase(),
+                    inputs: [...f.querySelectorAll('input,textarea,select')]
+                        .map(i => i.name || i.id).filter(Boolean)
+                }));
+            }""")
+            for fm in (pw_forms or []):
+                if fm.get("inputs"):
+                    recon_results.setdefault("forms", [])
+                    recon_results["forms"].append({
+                        "action": fm["action"], "method": fm["method"],
+                        "params": fm["inputs"], "form_fields": list(fm["inputs"]),
+                        "source": "playwright",
+                    })
+                    for pname in fm["inputs"]:
+                        recon_results.setdefault("parameters", [])
+                        if not any(isinstance(p, dict) and p.get("name") == pname
+                                   for p in recon_results["parameters"]):
+                            recon_results["parameters"].append({
+                                "name": pname, "url": target_url, "source": "playwright",
+                            })
+            await bctx.close()
+            logger.info("Playwright: 提取 %d forms", len(pw_forms or []))
+        except Exception as e:
+            logger.warning("Playwright 表单提取失败: %s", e)
+
+    # P2 Layer3: 从分类链接的 query string 提取参数
+    if not recon_results.get("parameters"):
+        categorized = recon_results.get("homepage_info", {}).get("categorized_links", {})
+        for cat, items in categorized.items():
+            for item in items:
+                link = item.get("link", "")
+                if "?" in link:
+                    try:
+                        from urllib.parse import parse_qs, urlparse
+                        parsed = urlparse(link if "http" in link else f"http://x{link}")
+                        for pname in parse_qs(parsed.query).keys():
+                            recon_results.setdefault("parameters", [])
+                            recon_results["parameters"].append({
+                                "name": pname, "url": link, "source": "link_query",
+                            })
+                    except Exception:
+                        pass
+
+    # L1-fix: P2 兜底 — 若 tools 失败/Playwright 不可用, 用纯 HTTP 重抽表单
+    if not recon_results.get("forms"):
+        try:
+            import httpx as _httpx
+            from app.agents.nodes.orchestrator import _extract_forms as _xf
+            async with _httpx.AsyncClient(timeout=15, follow_redirects=True) as _client:
+                _resp = await _client.get(target_url)
+                if _resp.status_code == 200 and _resp.text:
+                    _fallback_forms = _xf(_resp.text)
+                    for _fm in _fallback_forms:
+                        _act = _fm.get("action") or ""
+                        recon_results.setdefault("forms", [])
+                        recon_results["forms"].append({
+                            "action": _act, "method": _fm.get("method", "GET"),
+                            "params": _fm.get("params", []),
+                            "form_fields": _fm.get("form_fields", list(_fm.get("params", []))),
+                            "source": "http_fallback",
+                        })
+                        for _pn in _fm.get("params", []):
+                            recon_results.setdefault("parameters", [])
+                            if not any(isinstance(_p, dict) and _p.get("name") == _pn
+                                       for _p in recon_results["parameters"]):
+                                recon_results["parameters"].append({
+                                    "name": _pn, "url": target_url, "source": "http_fallback",
+                                })
+        except Exception as _e:
+            logger.warning("HTTP 表单兜底提取失败: %s", _e)
+
+    await emit(task_id, "lats_recon", "recon_complete", {
+        "dirs_found": len(recon_results.get("directories", [])),
+        "pages_crawled": len(recon_results.get("crawled_pages", [])),
+        "params_found": len(recon_results.get("parameters", [])),
+        "forms_found": len(recon_results.get("forms", [])),
+        "tool_health": recon_results.get("tool_health", {}),
+    })
+
+    # P1: 将 PCE 提取的表单 action 注入 homepage_info.categorized_links
+    for form in recon_results.get("forms", []):
+        action = form.get("action", "")
+        if action:
+            homepage = recon_results.setdefault("homepage_info", {})
+            cat_links = homepage.setdefault("categorized_links", {})
+            cat_links.setdefault("form_handler", [])
+            if not any(item.get("link") == action for item in cat_links["form_handler"]):
+                cat_links["form_handler"].append({"link": action, "score": 0.75})
+
+    # P0: 工具驱动攻击面构造 — 替代 LLM
+    from app.agents.lats.attack_surface_builder import build_attack_surface
+    surface = await build_attack_surface(recon_results, target_url, task_id)
+
+    # P0: LLM 仅提供策略建议
+    endpoint_summary = []
+    for ep in surface.endpoints[:25]:
+        endpoint_summary.append({
+            "path": ep["path"], "score": round(ep.get("score", 0), 2),
+            "category": ep.get("category", "unknown"),
+            "compatible_vulns": ep.get("compatible_vuln_types", [])[:5],
+        })
+
+    advice_messages = [
         {"role": "system", "content": ORCHESTRATOR_SYSTEM_PROMPT},
-        {"role": "user", "content": (
-            f"SRC 漏洞挖掘任务。目标: {target_url}\n\n"
-            f"侦察结果：\n"
-            f"- 目录/路径: {json.dumps(recon_results['directories'][:30], ensure_ascii=False)}\n"
-            f"- 页面链接: {json.dumps(recon_results['homepage_info'].get('links', [])[:40], ensure_ascii=False)}\n"
-            f"- 响应头: {json.dumps(dict(list(recon_results['homepage_info'].get('headers', {}).items())[:15]), ensure_ascii=False)}\n"
-            f"- 首页预览: {recon_results['homepage_info'].get('body_preview', '')[:1000]}\n"
-            f"- 参数: {json.dumps(recon_results.get('parameters', [])[:30], ensure_ascii=False)}\n"
-            f"- 表单: {json.dumps(recon_results.get('forms', [])[:15], ensure_ascii=False)}\n\n"
-            f"输出 JSON: {{target_profile, attack_surface, strategy}}"
-        )},
+        {"role": "user", "content": json.dumps({
+            "task_id": task_id, "target": target_url,
+            "tech_indicators": surface.recon_summary.get("tech_indicators", []),
+            "top_endpoints": endpoint_summary,
+            "total_endpoints": surface.total_endpoints,
+            "vuln_pages": surface.vuln_pages,
+            "forms": surface.forms[:5],
+        }, ensure_ascii=False)},
     ]
 
-    response_text = await llm.call(agent="orchestrator", messages=messages, task_id=task_id)
-
+    response_text = await llm.call(agent="orchestrator", messages=advice_messages, task_id=task_id)
     try:
         decision = json.loads(response_text)
     except json.JSONDecodeError:
@@ -228,47 +299,39 @@ async def lats_recon_node(state: dict) -> dict:
         except Exception:
             decision = {}
 
-    target_profile = decision.get("target_profile", {})
-    target_profile["base_url"] = target_url
-    bb.target_profile = target_profile
+    # 组装黑板 — 端点来自工具, 策略来自 LLM
+    bb.target_profile = {
+        "base_url": target_url,
+        "tech_stack": decision.get("tech_stack", surface.recon_summary.get("tech_indicators", [])),
+        "framework": decision.get("framework", ""),
+        "server": decision.get("server", ""),
+        "waf": decision.get("waf", ""),
+        "recon_data": {
+            "directories": recon_results.get("directories", [])[:50],
+            "homepage_info": recon_results.get("homepage_info", {}),
+            "tool_health": recon_results.get("tool_health", {}),
+        },
+    }
 
-    attack_surface = decision.get("attack_surface", {})
-    tool_endpoints = [{"path": d, "source": "dir_scan"} for d in recon_results.get("directories", [])[:20]]
-    param_endpoints = []
-    for p in recon_results.get("parameters", [])[:30]:
-        if isinstance(p, dict) and p.get("url"):
-            param_endpoints.append({"path": p["url"], "params": [p.get("name", "")], "source": "crawl"})
-        elif isinstance(p, str):
-            param_endpoints.append({"path": p, "params": [], "source": "crawl"})
-    form_endpoints = []
-    for f in recon_results.get("forms", [])[:15]:
-        if isinstance(f, dict) and f.get("action"):
-            form_endpoints.append({"path": f["action"], "method": f.get("method", "POST"), "params": f.get("params", []), "source": "form"})
-    attack_surface["endpoints"] = attack_surface.get("endpoints", []) + tool_endpoints + param_endpoints + form_endpoints
-    attack_surface["parameters"] = recon_results.get("parameters", [])[:50]
-    attack_surface["forms"] = recon_results.get("forms", [])[:20]
-    bb.attack_surface = attack_surface
+    bb.attack_surface = {
+        "endpoints": surface.endpoints,  # ← 工具驱动, 非 LLM
+        "parameters": surface.parameters,
+        "forms": surface.forms,
+    }
+    bb.focus_vuln_types = decision.get("focus_vuln_types", [])
 
-    # v2: 将侦察发现的端点初始录入 SharedKnowledge
-    for ep_data in attack_surface.get("endpoints", [])[:50]:
-        if isinstance(ep_data, dict):
-            path = ep_data.get("path", "")
-            method = ep_data.get("method", "GET")
-            source = ep_data.get("source", "recon")
-        elif isinstance(ep_data, str):
-            path = ep_data
-            method = "GET"
-            source = "recon"
-        else:
-            continue
+    # v2: 将端点录入 SharedKnowledge
+    for ep_data in surface.endpoints[:50]:
+        path = ep_data.get("path", "")
         if path and bb.shared_knowledge:
             try:
                 import asyncio
                 asyncio.ensure_future(
-                    bb.shared_knowledge.record_endpoint(path=path, method=method, source=source)
+                    bb.shared_knowledge.record_endpoint(path=path, method="GET", source="recon")
                 )
             except Exception:
                 pass
+
 
     await emit(task_id, "lats_recon", "agent_stopped", {"node": "recon"})
 
@@ -279,7 +342,7 @@ async def lats_recon_node(state: dict) -> dict:
             "agent": "lats_recon",
             "type": "recon_complete",
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "data": {"endpoints": len(attack_surface.get("endpoints", []))},
+            "data": {"endpoints": len(surface.endpoints)},
         }],
     }
 
@@ -332,21 +395,27 @@ def _is_endpoint_injectable(path: str) -> bool:
 
 
 # ──── P6: 配置路径精确约束 ────
+# L1-fix: 旧表用 `in` 子串匹配, '.git/'(带斜杠) 漏判 'foo.php/.git'(无斜杠)
+# 导致 dir_scan 的 bogus 目录被 _infer_vuln_from_path 误判成 SQLi 端点。
+# 改为正则, 版本控制目录以 .git/.svn/.hg/.bzr 后接 / 或字符串尾或 . 即匹配。
 _CONFIG_PATH_PATTERNS_V2 = (
-    '.git/', '.gitconfig', '.gitignore', '.env', '.svn/', '.hg/', '.bzr/',
-    'dockerfile', 'docker-compose', '.htaccess', '.htpasswd',
-    'robots.txt', 'sitemap', 'composer.lock', 'package-lock',
-    'yarn.lock', 'Gemfile.lock', 'Pipfile.lock', '.DS_Store',
-    'web.config', 'web.xml', 'server.xml', 'thumbs.db',
+    '.gitconfig', '.gitignore', '.env', 'dockerfile', 'docker-compose',
+    '.htaccess', '.htpasswd', 'robots.txt', 'sitemap', 'composer.lock',
+    'package-lock', 'yarn.lock', 'Gemfile.lock', 'Pipfile.lock',
+    '.DS_Store', 'web.config', 'web.xml', 'server.xml', 'thumbs.db',
     '.project', '.classpath', '.settings/', 'backup/', 'dump/',
     'phpinfo', 'info.php', 'test.php', 'readme', 'changelog',
     'license', 'copying',
 )
+# 版本控制目录正则 — 匹配 .git/.svn/.hg/.bzr (后跟 / 或 . 或字符串尾)
+_VERSION_CONTROL_RE = re.compile(r'\.(git|svn|hg|bzr)(?:[/.]|$)')
 
 
 def _is_config_path(path: str) -> bool:
     """P6: 判断是否为配置/静态文件路径 (仅允许 info_disclosure)"""
     path_lower = path.lower()
+    if _VERSION_CONTROL_RE.search(path_lower):
+        return True
     return any(p in path_lower for p in _CONFIG_PATH_PATTERNS_V2)
 
 
@@ -704,22 +773,97 @@ async def lats_init_tree_node(state: dict) -> dict:
     seen_branches = set()
 
     # v18: 单页模式 — 仅为目标 URL 创建分支
+    # L2/PR-3 修复: 单页模式不能直接丢弃 attack_surface — 否则会丢掉表单来源的
+    # http_method(POST) 与完整 form_fields, 导致 Level0 探针回退 GET 永远打不到 POST-only 注入点。
+    # 改为: 从 attack_surface 中查找与目标路径匹配的端点, 继承其 method/form_fields/params。
     if scan_mode == "single_page":
+        # 已规范化的目标路径 (与 attack_surface 端点 path 同源)
+        _norm_target_path = target_path or "/"
+        # 从 attack_surface 收集同一端点的能力 (method/form_fields/params), 取表单来源优先
+        _cap_method = "GET"
+        _cap_form_fields: list[str] = []
+        _cap_params: list[str] = []
+        # L2-fix: 优先从 attack_surface["forms"] 直接查表单 — forms 是 ground truth,
+        # 攻击面 endpoint 合并时 method/form_fields 易被无关来源覆盖成 GET/空。
+        for _fm in attack_surface.get("forms", []) or []:
+            if not isinstance(_fm, dict):
+                continue
+            _fma = _fm.get("action", "") or ""
+            # 归一化 form action 到 path 比较
+            if _fma.startswith("http"):
+                _fma_path = urlparse(_fma).path or "/"
+            elif _fma:
+                _fma_path = _fma
+            else:
+                _fma_path = _norm_target_path  # 空 action 默认当前页
+            if (_fma_path == _norm_target_path
+                    or _fma_path.endswith(_norm_target_path)
+                    or _norm_target_path.endswith(_fma_path)):
+                _fm_method = str(_fm.get("method", "GET")).upper()
+                if _fm_method == "POST":
+                    _cap_method = "POST"
+                _fm_fields = list(_fm.get("form_fields") or _fm.get("params") or [])
+                for _ff in _fm_fields:
+                    if _ff and _ff not in _cap_form_fields:
+                        _cap_form_fields.append(_ff)
+                    if _ff and _ff not in _cap_params:
+                        _cap_params.append(_ff)
+                logger.info("single_page form-authority: action=%s method=%s ff=%s",
+                            _fma, _fm_method, _cap_form_fields)
+        for _ep in attack_surface.get("endpoints", []):
+            if not isinstance(_ep, dict):
+                continue
+            _ep_path = _ep.get("path", "")
+            if _ep_path == _norm_target_path or _ep_path.endswith(_norm_target_path) or _norm_target_path.endswith(_ep_path):
+                if _ep.get("http_method", "").upper() == "POST":
+                    _cap_method = "POST"  # form 来源优先, 但需是 POST 才覆盖
+                for _p in _ep.get("params", []):
+                    if _p and _p not in _cap_params:
+                        _cap_params.append(_p)
+                for _f in _ep.get("form_fields", []):
+                    if _f and _f not in _cap_form_fields:
+                        _cap_form_fields.append(_f)
         # 确保目标 URL 本身作为端点被处理
         if target_path and target_path != "/":
-            single_endpoints = [{"path": target_path, "params": [], "source": "target_url"}]
+            single_endpoints = [{
+                "path": target_path,
+                "params": list(_cap_params),
+                "source": "target_url",
+                "http_method": _cap_method,
+                "form_fields": list(_cap_form_fields),
+            }]
             # 从 query string 提取参数
             if parsed_target and parsed_target.query:
                 from urllib.parse import parse_qs as _parse_qs
                 try:
                     qs_params = list(_parse_qs(parsed_target.query).keys())
-                    single_endpoints[0]["params"] = qs_params
+                    for _qp in qs_params:
+                        if _qp not in single_endpoints[0]["params"]:
+                            single_endpoints[0]["params"].append(_qp)
                     logger.info("single_page: extracted params from URL: %s", qs_params)
                 except Exception:
                     pass
+            logger.info("single_page: capability method=%s form_fields=%s params=%s",
+                         _cap_method, _cap_form_fields, single_endpoints[0]["params"])
         else:
-            single_endpoints = [{"path": target_path or "/", "params": [], "source": "target_url"}]
+            single_endpoints = [{"path": target_path or "/", "params": list(_cap_params),
+                                 "source": "target_url", "http_method": _cap_method,
+                                 "form_fields": list(_cap_form_fields)}]
         endpoints_to_process = single_endpoints
+        # L2/PR-3 修复: 单页目标默认视为可达 (它是任务目标), 并把表单能力写入
+        # endpoint_meta_cache, 使主循环不因 accessibility=unknown 而整端点跳过。
+        for _se in single_endpoints:
+            _sp = _se.get("path", "")
+            if _sp:
+                endpoint_meta_cache[_sp] = {
+                    "accessibility": "accessible",
+                    "status": 200,
+                    "is_config_path": _is_config_path(_sp),
+                    "has_forms": bool(_se.get("form_fields")),
+                    # 保留 attack_surface 的 http_method/form_fields 供 default_meta 透传
+                    "http_method": _se.get("http_method", "GET"),
+                    "form_fields": list(_se.get("form_fields", [])),
+                }
         # P1-2: 在 single_page 模式下，限制只测试 focus_vuln_types
         # 这样可以避免 Agent 被无关漏洞类型分散注意力
         logger.info("single_page: focus_vuln_types=%s, endpoints=%s", focus_vuln_types, [e['path'] for e in single_endpoints])
@@ -757,8 +901,14 @@ async def lats_init_tree_node(state: dict) -> dict:
             continue
 
         # P1: 默认的 endpoint_metadata
-        default_meta = {"accessibility": accessibility, "is_config_path": is_config,
-                        "status": meta.get("status", 0)}
+        # L2/PR-3: 携带 http_method + form_fields 供 Level0 探针使用
+        default_meta = {
+            "accessibility": accessibility, "is_config_path": is_config,
+            "status": meta.get("status", 0),
+            "http_method": endpoint.get("http_method", "GET"),
+            "form_fields": list(endpoint.get("form_fields", [])),
+            "reachable": True,  # accessible/通过的端点均为可达
+        }
 
         if not params:
             default_vulns = ["info_disclosure", "auth_bypass"]
@@ -894,6 +1044,15 @@ async def lats_init_tree_node(state: dict) -> dict:
                     value_estimate=max(0.1, min(1.0, val)), created_at_cycle=0,
                 )
                 child.status = NodeStatus.LOW_SIGNAL  # 低优先级, 预算宽松时执行
+                # L2/PR-3: 透传端点能力 (method/form_fields) 给 Level0 探针
+                _fb_ep = endpoint_data if isinstance(endpoint_data, dict) else {}
+                child.endpoint_metadata = dict(endpoint_meta_cache.get(path, {
+                    "accessibility": "accessible", "is_config_path": _is_config_path(path),
+                    "status": 0,
+                    "http_method": _fb_ep.get("http_method", "GET"),
+                    "form_fields": list(_fb_ep.get("form_fields", [])),
+                    "reachable": True,
+                }))
                 branches_created += 1
 
     # v5: 为 URL 推断的漏洞类型创建分支 (即使无参)
@@ -912,6 +1071,12 @@ async def lats_init_tree_node(state: dict) -> dict:
             value_estimate=value, created_at_cycle=0,
         )
         child.status = NodeStatus.SEED
+        # L2/PR-3: 继承单页端点能力 (POST method/form_fields)
+        child.endpoint_metadata = dict(endpoint_meta_cache.get(target_path, {
+            "accessibility": "accessible", "is_config_path": _is_config_path(target_path),
+            "status": 0, "http_method": _cap_method, "form_fields": list(_cap_form_fields),
+            "reachable": True,
+        }))
         branches_created += 1
 
     # v9/v18: 分层剪枝 — 单页模式用更小的上限
@@ -1075,9 +1240,13 @@ async def lats_react_execute_node(state: dict) -> dict:
         return {"react_results": [], "events": []}
 
     target_profile = bb.target_profile or {}
-    base_url = target_profile.get("base_url", "")
-    parsed = urlparse(base_url)
+    base_url_full = target_profile.get("base_url", "")
+    parsed = urlparse(base_url_full)
     host = parsed.hostname or "localhost"
+    # L2-fix: Level0 探针的 base_url 用 origin(scheme://netloc), 而非完整
+    # target_url — 否则 _build_url 把 path 拼到含文件名的 base 之后, 产生
+    # "sqli_id.php/vul/sqli/sqli_id.php" 这类 bogus 双重路径。
+    base_url = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else base_url_full
 
     context = ExecutionContext(
         task_id=task_id,

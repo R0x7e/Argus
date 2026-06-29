@@ -9,6 +9,7 @@ LATS 动态扩展引擎
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any

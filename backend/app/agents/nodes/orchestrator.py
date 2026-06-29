@@ -205,7 +205,11 @@ def _extract_smart_body_snippets(html: str, max_snippets: int = 8) -> list[str]:
 
 
 def _extract_links(html: str) -> list[str]:
-    """从 HTML 中提取所有链接路径 (P0: 分类评分版, 不排序)"""
+    """从 HTML 中提取所有链接路径 (P0: 分类评分版, 不排序)
+
+    L1-fix: 保留 query string — 旧实现用 split("?")[0] 丢弃了 query,
+    导致下游 _extract_params_from_links 永远解析不到参数(params 恒为 0)。
+    """
     links = set()
     for match in re.finditer(r'(?:href|action|src)=["\']([^"\'#]+)["\']', html, re.IGNORECASE):
         link = match.group(1)
@@ -216,22 +220,27 @@ def _extract_links(html: str) -> list[str]:
         if _STATIC_ASSET_PATTERN.search(link):
             continue
 
-        # 绝对路径或以 / 开头
+        # 保留带 query string 的完整链接 (供 params 提取)
         if link.startswith("/") or link.startswith("http"):
-            links.add(link.split("?")[0])
+            links.add(link)
         # P5: 相对路径 — 含有文件扩展名或目录结构的都保留
         elif "/" in link or "." in link:
-            links.add(link.split("?")[0])
+            links.add(link)
 
     return list(links)  # 不排序, 由分类器排序
 
 
 def _extract_forms(html: str) -> list[dict]:
-    """从 HTML 中提取表单信息（action + 参数名）"""
-    import re
+    """从 HTML 中提取表单信息（action + 参数名 + method）
+
+    L1-fix: 旧正则强制要求 action="..." 属性, 但 DVWA/Pikachu 等单页靶机
+    表单常无 action (默认提交当前页) → forms 恒为 0。
+    改为匹配 <form ...>...</form> 整块, action 缺失时默认空字符串
+    (由调用方按 current page URL 解析)。
+    """
     forms = []
     form_pattern = re.compile(
-        r'<form[^>]*action=["\']([^"\']*)["\'][^>]*>(.*?)</form>',
+        r'<form([^>]*)>(.*?)</form>',
         re.IGNORECASE | re.DOTALL,
     )
     input_pattern = re.compile(
@@ -239,11 +248,14 @@ def _extract_forms(html: str) -> list[dict]:
         re.IGNORECASE,
     )
     method_pattern = re.compile(r'method=["\']([^"\']+)["\']', re.IGNORECASE)
+    action_pattern = re.compile(r'action=["\']([^"\']*)["\']', re.IGNORECASE)
 
     for form_match in form_pattern.finditer(html):
-        action = form_match.group(1)
-        form_body = form_match.group(2)
-        method_m = method_pattern.search(form_match.group(0))
+        form_tag = form_match.group(1) or ""
+        form_body = form_match.group(2) or ""
+        action_m = action_pattern.search(form_tag)
+        action = action_m.group(1) if action_m else ""
+        method_m = method_pattern.search(form_tag)
         method = method_m.group(1).upper() if method_m else "GET"
         params = input_pattern.findall(form_body)
         if action or params:
@@ -251,6 +263,7 @@ def _extract_forms(html: str) -> list[dict]:
                 "action": action,
                 "method": method,
                 "params": params,
+                "form_fields": list(params),  # L2 完整表单字段集
             })
     return forms
 
@@ -304,6 +317,33 @@ def _build_execution_context(state: VulnHuntState) -> ExecutionContext:
     )
 
 
+def _derive_scan_origin(target_url: str) -> str:
+    """L1-fix: 计算 dir_scan 的扫描基点 — 剥离文件名, 取所在目录。
+
+    避免把单页脚本(如 .../sqli_id.php)当目录爆破,
+    产生 "sqli_id.php/.git" 这类 PATH_INFO bogus 目录。
+
+    - http://h/a/b/sqli_id.php → http://h/a/b
+    - http://h/a/b/            → http://h/a/b
+    - http://h/a               → http://h (无路径)
+    - 含 query 的同样剥离 query
+    """
+    try:
+        parsed = urlparse(target_url)
+    except Exception:
+        return target_url.rstrip("/") or target_url
+    path = parsed.path or "/"
+    # 取最后一段, 若像文件名(含 .) 则上一级
+    last_seg = path.rstrip("/").rsplit("/", 1)[-1]
+    if "." in last_seg:
+        base_path = path.rsplit("/", 1)[0]  # 去掉文件名段
+        if not base_path:
+            base_path = ""
+    else:
+        base_path = path.rstrip("/")
+    return f"{parsed.scheme}://{parsed.netloc}{base_path}"
+
+
 async def _run_recon_tool(tool_name: str, params: dict, context: ExecutionContext) -> dict:
     """安全执行侦察工具，捕获异常"""
     from app.tools import tool_registry
@@ -353,8 +393,18 @@ async def _run_reconnaissance(state: VulnHuntState) -> dict:
     }
 
     # === 第一层：目录扫描 + 首页请求 ===
+    # L1-fix: dir_scan 不能把单页 target_url 当 base — 否则 wordlist 拼到
+    # ".../sqli_id.php/.git" 产生 bogus 目录 (Pikachu 对任意路径回 200)。
+    # 改为剥离文件名, 取所在目录作为扫描基点。
+    scan_origin = _derive_scan_origin(target_url)
+
+    recon_results["tool_health"] = {
+        "dir_scan": "unknown", "deep_crawl": "unknown",
+        "playwright": "unknown", "http": "unknown",
+    }
+
     tasks = [
-        _run_recon_tool("dir_scan", {"base_url": target_url}, context),
+        _run_recon_tool("dir_scan", {"base_url": scan_origin}, context),
         _run_recon_tool("http_request", {"url": target_url, "method": "GET"}, context),
     ]
 
@@ -366,33 +416,72 @@ async def _run_reconnaissance(state: VulnHuntState) -> dict:
         found_paths = dir_result.get("found_paths", [])
         recon_results["directories"] = [p.get("path", p) if isinstance(p, dict) else p for p in found_paths]
         recon_results["tools_run"].append("dir_scan")
+        recon_results["tool_health"]["dir_scan"] = "ok"
     elif isinstance(dir_result, dict):
         recon_results["errors"].append(f"dir_scan: {dir_result.get('error', 'unknown')}")
+        recon_results["tool_health"]["dir_scan"] = f"failed:{dir_result.get('error', 'unknown')[:40]}"
 
-    # 处理首页请求结果
+    # 处理首页请求结果 — 三层回退提取 (P0-2)
     homepage_result = results[1]
     all_links = []
+    body = ""
+    forms = []
+    params = []
     if isinstance(homepage_result, dict) and homepage_result.get("success"):
         body = homepage_result.get("body", "") or ""
         links = _extract_links(body)
         all_links = links[:]
-        # P0: 链接分类与评分
+        forms = _extract_forms(body)
+        params = _extract_params_from_links(links)
+        logger.info("Layer1 工具: %d links, %d forms", len(links), len(forms))
+    # Layer 2: httpx 直连回退
+    if not all_links:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                resp = await client.get(target_url)
+                if resp.status_code == 200:
+                    body = resp.text
+                    links = _extract_links(body)
+                    all_links = links[:]
+                    forms = _extract_forms(body)
+                    params = _extract_params_from_links(links)
+                    logger.info("Layer2 httpx: %d links, %d forms (status=%d)",
+                                len(links), len(forms), resp.status_code)
+        except Exception as e:
+            logger.warning("Layer2 httpx 失败: %s", e)
+    # Layer 3: Playwright 渲染回退
+    if not all_links:
+        try:
+            from app.core.playwright_manager import get_browser
+            browser = get_browser()
+            bctx = await browser.new_context(ignore_https_errors=True)
+            page = await bctx.new_page()
+            await page.goto(target_url, wait_until="networkidle", timeout=15000)
+            body = await page.content()
+            links = _extract_links(body)
+            all_links = links[:]
+            forms = _extract_forms(body)
+            params = _extract_params_from_links(links)
+            await bctx.close()
+            logger.info("Layer3 Playwright: %d links, %d forms", len(links), len(forms))
+            recon_results["tool_health"]["playwright"] = "ok"
+        except Exception as e:
+            logger.warning("Layer3 Playwright 失败: %s", e)
+            recon_results["tool_health"]["playwright"] = f"unavailable:{str(e)[:40]}"
+    # 构建 homepage_info
+    if all_links:
         categorized = _classify_and_score_links(links)
-        # P0: 提取评分最高的链接 (用于爬取)
         scored_links = []
         for cat_items in categorized.values():
             scored_links.extend(cat_items)
         scored_links.sort(key=lambda x: x["score"], reverse=True)
         top_scored_paths = [item["link"] for item in scored_links[:60]]
-        # 提取页面中的表单和参数
-        forms = _extract_forms(body)
-        params = _extract_params_from_links(links)
-        # P0: 智能 body 片段
-        smart_snippets = _extract_smart_body_snippets(body)
+        smart_snippets = _extract_smart_body_snippets(body) if body else []
         recon_results["homepage_info"] = {
-            "status_code": homepage_result.get("status_code"),
-            "headers": homepage_result.get("headers", {}),
-            "body_preview": body[:3000],
+            "status_code": homepage_result.get("status_code") if isinstance(homepage_result, dict) else 200,
+            "headers": homepage_result.get("headers", {}) if isinstance(homepage_result, dict) else {},
+            "body_preview": body[:3000] if body else "",
             "smart_snippets": smart_snippets,
             "links": top_scored_paths[:50],
             "categorized_links": {cat: items[:15] for cat, items in categorized.items()},
@@ -403,9 +492,10 @@ async def _run_reconnaissance(state: VulnHuntState) -> dict:
         recon_results["forms"] = forms
         recon_results["parameters"] = params
         recon_results["tools_run"].append("http_request")
+        recon_results["tool_health"]["http"] = "ok"
     elif isinstance(homepage_result, dict):
         recon_results["errors"].append(f"http_request: {homepage_result.get('error', 'unknown')}")
-
+        recon_results["tool_health"]["http"] = f"failed:{homepage_result.get('error', 'unknown')[:40]}"
     # === 第二层：递归抓取发现的链接（P0: 评分排序优先爬取高分端点, 最多 15 个） ===
     crawl_targets = []
     base_parsed = urlparse(target_url)
@@ -487,10 +577,13 @@ async def _run_reconnaissance(state: VulnHuntState) -> dict:
         if playwright_params:
             recon_results["parameters"].extend(playwright_params)
             recon_results["tools_run"].append("playwright_params")
+        recon_results["tool_health"]["playwright"] = "ok"
         if playwright_forms:
             recon_results["forms"].extend(playwright_forms)
     except Exception as e:
         logger.warning("Playwright param extraction failed: %s", str(e))
+        if recon_results.get("tool_health", {}).get("playwright") == "unknown":
+            recon_results["tool_health"]["playwright"] = f"unavailable:{str(e)[:40]}"
 
     # 去重参数
     seen_params = set()
@@ -545,10 +638,12 @@ async def _run_reconnaissance(state: VulnHuntState) -> dict:
                             seen_params.add(key)
                             unique_params.append(p_entry)
                 recon_results["tools_run"].append("deep_crawl")
+                recon_results["tool_health"]["deep_crawl"] = "ok"
                 logger.info("deep_crawl: %d URLs, %d forms, %d params",
                             len(dc_urls), len(dc_forms), len(dc_params))
     except Exception as e:
         logger.warning("deep_crawl 执行失败: %s", str(e))
+        recon_results["tool_health"]["deep_crawl"] = f"failed:{str(e)[:40]}"
     recon_results["parameters"] = unique_params[:100]
 
     # 更新 homepage_info 中的 links 为完整集合

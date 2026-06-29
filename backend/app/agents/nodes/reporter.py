@@ -191,10 +191,24 @@ async def reporter_node(state: VulnHuntState) -> dict:
         "attack_surface_endpoints": endpoint_strs,
         "subdomains_count": len(recon_data.get("subdomains", [])),
         "open_ports": ", ".join(str(p) for p in recon_data.get("open_ports", [])[:20]) or "无",
+        "tool_health": recon_data.get("tool_health", {}),
         "findings": findings_data,
         "false_positives": bb.false_positives,
         "recommendations": recommendations,
     }
+
+    # L4-fix: 挖掘过程诊断 — 基于已知信息生成可解释项 (不依赖 LLM, 避免额外失败)
+    diagnosis: list[str] = []
+    th = recon_data.get("tool_health", {}) or {}
+    if th.get("playwright", "").startswith(("unavailable", "failed")):
+        diagnosis.append("Playwright 渲染不可用, 表单/参数可能依赖纯 HTTP 提取兜底")
+    if th.get("deep_crawl", "").startswith("failed"):
+        diagnosis.append("deep_crawl (crawlergo) 未成功执行, JS 事件/动态表单可能遗漏")
+    if endpoint_strs and all("(dir_scan" in e for e in endpoint_strs):
+        diagnosis.append("攻击面以 dir_scan 结果为主, 可能存在 PATH_INFO 误报, 建议核查端点可达性")
+    if not bb.findings:
+        diagnosis.append("未发现漏洞, 建议确认 POST-only 注入点是否被 Level0 探针覆盖")
+    template_context["diagnosis"] = diagnosis
 
     # 渲染报告
     await emit(task_id, "reporter", "thinking", {

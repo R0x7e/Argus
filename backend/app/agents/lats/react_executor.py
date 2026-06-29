@@ -72,8 +72,13 @@ async def _maybe_record_to_knowledge(
     action_params: dict,
     node,  # SearchNode
     step_idx: int,
+    shared_knowledge=None,
 ) -> None:
-    """P2-4: 从 Observation 中提取知识并写入节点状态 (供 expand 节点使用)"""
+    """P2-4: 从 Observation 中提取知识并写入节点状态 (供 expand 节点使用)
+
+    L4-fix: 同时写入 SharedKnowledge 单例, 修复跨分支知识断流
+    (旧实现 knowledge_stats 恒为 0)。
+    """
     try:
         # 1. 提取有效参数信息
         if observation.success and observation.tool_call:
@@ -86,6 +91,16 @@ async def _maybe_record_to_knowledge(
                         if not hasattr(node.state, '_effective_params'):
                             node.state._effective_params = set()
                         node.state._effective_params.add(param)
+                    # L4: 同步到 SharedKnowledge (await, 避免再次未 await)
+                    if shared_knowledge and param:
+                        try:
+                            await shared_knowledge.record_param(
+                                param,
+                                endpoint=node.state.current_endpoint or "",
+                                context="query" if str(action_params.get("method", "")).upper() != "POST" else "body",
+                            )
+                        except Exception:
+                            pass
 
         # 2. 提取 WAF/过滤规则
         if observation.filter_rules:
@@ -96,6 +111,18 @@ async def _maybe_record_to_knowledge(
                     node.state._waf_rules = {}
                 node.state._waf_rules["blocked"] = blocked
                 node.state._waf_rules["allowed"] = allowed
+            if shared_knowledge and (blocked or allowed):
+                try:
+                    shared_knowledge.waf_profile["filtered_chars"] = list(
+                        set((shared_knowledge.waf_profile.get("filtered_chars", []) or []) + blocked)
+                    )
+                    shared_knowledge.waf_profile["allowed_chars"] = list(
+                        set((shared_knowledge.waf_profile.get("allowed_chars", []) or []) + allowed)
+                    )
+                    if blocked:
+                        shared_knowledge.waf_profile["detected"] = True
+                except Exception:
+                    pass
 
         # 3. 提取错误信息泄露
         if observation.error_message_leaked and hasattr(node, 'state'):
@@ -117,9 +144,22 @@ async def _maybe_record_to_knowledge(
                         if not hasattr(node.state, '_vuln_signals'):
                             node.state._vuln_signals = []
                         node.state._vuln_signals.append(fact[:200])
+                    # L4: 同步到 SharedKnowledge.vuln_signals
+                    if shared_knowledge:
+                        try:
+                            await shared_knowledge.record_vuln_signal(
+                                endpoint=node.state.current_endpoint or "",
+                                param=node.state.current_param or action_params.get("param", "") or "",
+                                vuln_type=node.state.vuln_type or "",
+                                signal_type="error_leaked" if "error" in fact_lower or "错误" in fact_lower else "other",
+                                evidence=fact[:200],
+                                source_node_id=node.id,
+                            )
+                        except Exception:
+                            pass
 
     except Exception:
-        pass  # 知识记录失败不影响核心流程
+        logger.debug("knowledge record skipped (non-fatal)")
 
 async def react_agent_loop(
     node: SearchNode,
@@ -175,6 +215,9 @@ async def react_agent_loop(
             "current_param": state.current_param,
             "vuln_type": state.vuln_type,
             "known_facts": state.known_facts[-15:],
+            # L2/PR-3: 传端点能力给 prompt, 让 LLM 用 POST + 完整表单字段
+            "http_method": (getattr(node, "endpoint_metadata", {}) or {}).get("http_method", "GET"),
+            "form_fields": (getattr(node, "endpoint_metadata", {}) or {}).get("form_fields", []),
         }
 
         step_history = [
@@ -262,6 +305,24 @@ async def react_agent_loop(
         action_str = parsed.get("action", "give_up")
         action_params = parsed.get("params", {})
 
+        # L2/PR-3: 注入端点能力默认值 — LLM 常默认 GET, 但 POST-only 端点
+        # 用 GET 永远打不到注入点 (Pikachu sqli_id 只认 POST id)。
+        # 对 inject/batch_inject 类动作, 若 LLM 未显式指定 method, 用节点
+        # capability 的 http_method 默认; 并补全 form_fields 供 POST body 重构。
+        if action_str in ("inject_payload", "batch_inject", "sqli_detect"):
+            _cap_meta = getattr(node, "endpoint_metadata", {}) or {}
+            _cap_method = str(_cap_meta.get("http_method", "")).upper()
+            _cap_ff = list(_cap_meta.get("form_fields", []) or [])
+            if _cap_method == "POST" and not action_params.get("method"):
+                action_params["method"] = "POST"
+            if _cap_method == "POST" and _cap_ff and not action_params.get("form_fields"):
+                action_params["form_fields"] = _cap_ff
+            # url 缺失时用节点端点 URL
+            if not action_params.get("url"):
+                _ep = node.state.current_endpoint or ""
+                if _ep:
+                    action_params["url"] = _ep
+
         # === 控制动作处理 ===
         if action_str == ActionType.BACKTRACK or action_str == "backtrack":
             steps.append(ThoughtStep(
@@ -335,10 +396,15 @@ async def react_agent_loop(
 
         # === v2: 记录到共享知识库 ===
         try:
-            from .shared_knowledge import SharedKnowledge
-            _maybe_record_to_knowledge(observation, action_str, action_params, node, step_idx)
-        except Exception:
-            pass  # 知识库记录失败不影响核心流程
+            _sk = getattr(context, '_shared_knowledge', None)
+            await _maybe_record_to_knowledge(
+                observation, action_str, action_params, node, step_idx,
+                shared_knowledge=_sk,
+            )
+        except Exception as _ke:
+            # L4-fix: 旧实现把 async 函数同步调用 (返回 coroutine 未 await) 且
+            # 用裸 except:pass 静默 RuntimeWarning, 导致知识回路全断。
+            logger.warning("knowledge record failed: %s", _ke)
 
         # === v17: 工具异常检测 ===
         if observation.success and not observation.new_info_gained:

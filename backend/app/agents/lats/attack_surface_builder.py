@@ -124,16 +124,28 @@ async def build_attack_surface(
             })
 
     # ── 来源 2: 首页表单 ──
+    # L1-fix: 表单无 action 时默认提交当前页 (DVWA/Pikachu 常见)
     for form in recon_results.get("forms", []):
         action = form.get("action", "")
-        if action:
-            raw_endpoints.append({
-                "path": action,
-                "source": "form",
-                "priority": 0.75,
-                "params": form.get("params", []),
-                "http_method": form.get("method", "GET"),
-            })
+        if not action:
+            # 默认提交到目标 URL 当前页
+            action = target_url if target_url else ""
+            if not action:
+                continue
+        # 标准化: 若 action 是绝对 URL 且属于同站, 转为路径
+        if action.startswith("http"):
+            from urllib.parse import urlparse as _pu
+            _ap = _pu(action)
+            if target_url and _pu(target_url).netloc == _ap.netloc:
+                action = _ap.path or "/"
+        raw_endpoints.append({
+            "path": action,
+            "source": "form",
+            "priority": 0.75,
+            "params": form.get("params", []),
+            "http_method": form.get("method", "GET"),
+            "form_fields": form.get("form_fields", list(form.get("params", []))),
+        })
 
     # ── 来源 3: 首页参数 URL ──
     for p in recon_results.get("parameters", [])[:30]:
@@ -185,6 +197,31 @@ async def build_attack_surface(
         "priority": 0.8,
         "params": [],
     })
+    # ── 来源 8 (P2): crawled_pages 中发现的链接 ──
+    for page in recon_results.get("crawled_pages", [])[:15]:
+        if isinstance(page, dict):
+            url = page.get("url", "")
+            if url and url not in [ep["path"] for ep in raw_endpoints]:
+                raw_endpoints.append({
+                    "path": url, "source": "crawled_page",
+                    "priority": 0.5, "params": [],
+                })
+
+    # ── 来源 9 (P2): PCE/Playwright 提取的参数 URL ──
+    for param_entry in recon_results.get("parameters", []):
+        url = param_entry.get("url", "")
+        name = param_entry.get("name", "")
+        if url and name:
+            # 合并到已有端点或新建
+            existing = [ep for ep in raw_endpoints if ep["path"] == url]
+            if existing:
+                if name not in existing[0].setdefault("params", []):
+                    existing[0]["params"].append(name)
+            else:
+                raw_endpoints.append({
+                    "path": url, "source": "pce_param",
+                    "priority": 0.55, "params": [name],
+                })
 
     logger.info("AttackSurface builder: collected %d raw endpoints", len(raw_endpoints))
 
@@ -203,6 +240,7 @@ async def build_attack_surface(
                 "sources": [ep.get("source", "")],
                 "priority": ep.get("priority", 0.3),
                 "http_method": ep.get("http_method", "GET"),
+                "form_fields": list(ep.get("form_fields", [])),
             }
         else:
             existing = merged[path]
@@ -210,14 +248,40 @@ async def build_attack_surface(
             if ep.get("source") not in existing["sources"]:
                 existing["sources"].append(ep.get("source", ""))
             existing["priority"] = max(existing["priority"], ep.get("priority", 0))
-            # 保留 form 来源的 http_method
-            if ep.get("source") == "form" and ep.get("http_method"):
-                existing["http_method"] = ep.get("http_method", "GET")
+            # 保留 form 来源的 http_method 与完整表单字段
+            if ep.get("source") == "form":
+                if ep.get("http_method"):
+                    existing["http_method"] = ep.get("http_method", "GET")
+                ff = ep.get("form_fields", [])
+                for _f in ff:
+                    if _f not in existing.get("form_fields", []):
+                        existing.setdefault("form_fields", []).append(_f)
+
+    # ── P3 Step 2.5: 从 URL 文件名推断参数 ──
+    _URL_PARAM_HINTS = {
+        "sqli_id": ["id"], "sqli_str": ["name", "id"], "sqli_search": ["name", "keyword"],
+        "rce_ping": ["ipaddress", "cmd", "ping"], "rce_eval": ["txt", "cmd"],
+        "xss_reflected_get": ["message"], "xss_stored": ["message"],
+        "xss_dom": ["text", "id"], "fi_local": ["filename"],
+        "fi_remote": ["filename", "url"], "ssrf_curl": ["url"],
+        "ssrf_fgc": ["file", "url"], "bf_form": ["username", "password"],
+        "bf_client": ["username", "password"], "bf_server": ["username", "password"],
+        "csrf_login": ["username", "password"], "pkxss": ["username", "password"],
+        "urlredirect": ["url"], "unsafeupload": ["file"],
+        "unsafedownload": ["filename"], "overpermission": ["username", "password"],
+    }
+    for path, ep in merged.items():
+        path_lower = path.lower()
+        for hint_pattern, param_names in _URL_PARAM_HINTS.items():
+            if hint_pattern in path_lower:
+                for p in param_names:
+                    if p not in ep["params"]:
+                        ep["params"].append(p)
+                break
 
     # ── Step 3: P0 分类 + 评分 ──
     for path, ep in merged.items():
         cat = _classify_link(path)
-        ep["category"] = cat
         ep["score"] = max(
             ep.get("priority", 0),
             _score_link(path, cat)

@@ -390,6 +390,11 @@ class SearchTree:
     # ──── Pruning + Graveyard ────
 
     def should_prune(self, node: SearchNode, budget_ratio: float = 1.0) -> bool:
+        # L3-fix: 根节点永不被剪 — 旧实现 root 在子节点全 killed 时也会被
+        # 标 PRUNED, 导致 all_explored() 第 1 个 dry cycle 即 true, 任务直接
+        # 转报告, max_cycles 预算只用 1 轮。
+        if node.id == self.root_id:
+            return False
         if node.visit_count >= 5 and node.total_reward <= 0:
             return True
         if node.depth >= 15:
@@ -401,6 +406,9 @@ class SearchTree:
         return False
 
     def prune_node(self, node_id: str) -> None:
+        # L3-fix: 根节点不可剪
+        if node_id == self.root_id:
+            return
         node = self.nodes.get(node_id)
         if node:
             node.status = NodeStatus.PRUNED

@@ -38,6 +38,31 @@
 - 子域名: {{ subdomains_count }} 个
 - 开放端口: {{ open_ports }}
 
+**工具健康度**:
+{% if tool_health %}
+{% for k, v in tool_health.items() %}
+- {{ k }}: {{ v }}
+{% endfor %}
+{% else %}
+- 未收集
+{% endif %}
+
+---
+
+## 挖掘过程诊断
+
+{% if findings_count == 0 %}
+本次未发现确认漏洞。可能原因与建议：
+{% if diagnosis %}
+{% for d in diagnosis %}
+- {{ d }}
+{% endfor %}
+{% else %}
+- 侦察工具未能提取表单/参数时, 检查 Playwright 与 deep_crawl 健康度
+- 仅 GET 探测可能漏掉 POST-only 注入点, 建议确认端点能力模型已启用 POST 探针
+{% endif %}
+{% endif %}
+
 ---
 
 ## 漏洞详情

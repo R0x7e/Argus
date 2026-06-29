@@ -96,20 +96,34 @@ class Observation:
     baseline_time_ms: int = 0
 
 
-def _build_inject_url(url: str, param: str, payload: str, method: str = "GET") -> dict:
-    """构造注入请求参数"""
+def _build_inject_url(url: str, param: str, payload: str, method: str = "GET",
+                      form_fields: list[str] | None = None) -> dict:
+    """构造注入请求参数
+
+    L2/PR-3: POST 时用完整表单字段重构 body — 旧实现只拼 `param=payload`,
+    缺失 submit 等必填字段可能被后端校验拒收 / 参数未被处理。
+    """
     if method.upper() == "GET":
         parsed = urlparse(url)
         qs = parse_qs(parsed.query, keep_blank_values=True)
-        qs[param] = [payload]
+        if param:
+            qs[param] = [payload]
         new_query = urlencode(qs, doseq=True)
         full_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
         return {"url": full_url, "method": "GET", "follow_redirects": False}
     else:
+        # POST: 用完整表单字段重构 body, 命中参数填 payload, 其余填空/默认
+        fields = list(form_fields) if form_fields else ([param] if param else [])
+        body_dict: dict[str, str] = {}
+        if param:
+            body_dict[param] = str(payload)
+        for f in fields:
+            if f and f not in body_dict:
+                body_dict[f] = ""
         return {
             "url": url,
             "method": "POST",
-            "body": f"{param}={payload}",
+            "body": urlencode(body_dict, doseq=True),
             "headers": {"Content-Type": "application/x-www-form-urlencoded"},
             "follow_redirects": False,
         }
@@ -194,7 +208,8 @@ async def _execute_inject(params: dict, context: ExecutionContext, registry, sta
         sep = "/" if url.endswith("/") else "/"
         req_params = {"url": f"{url}{sep}{payload}", "method": method or "GET", "follow_redirects": False}
     else:
-        req_params = _build_inject_url(url, param, payload, method)
+        req_params = _build_inject_url(url, param, payload, method,
+                                       form_fields=params.get("form_fields"))
     tool = registry.get("http_request")
     result = await tool.execute(req_params, context)
 
@@ -217,7 +232,8 @@ async def _execute_inject(params: dict, context: ExecutionContext, registry, sta
     bl_body, bl_status, bl_time, bl_orig_len = "", 0, 0, 0
     if param and payload and not skip_baseline:
         try:
-            bl_req = _build_inject_url(url, param, baseline_value, method)
+            bl_req = _build_inject_url(url, param, baseline_value, method,
+                                       form_fields=params.get("form_fields"))
             bl_result = await tool.execute(bl_req, context)
             if bl_result.get("success"):
                 bl_body = bl_result.get("body", "") or ""
@@ -583,8 +599,9 @@ async def _execute_batch_inject(params: dict, context: ExecutionContext, registr
         return Observation(success=False, summary="batch_inject 缺少 url/param/payloads")
 
     tool = registry.get("http_request")
+    form_fields = params.get("form_fields") or []
     # Baseline — 使用中性参数值, 而非裸 URL (裸 URL 可能返回不同页面)
-    baseline_url = _build_inject_url(url, param, "1", method)["url"]
+    baseline_url = _build_inject_url(url, param, "1", method, form_fields=form_fields)["url"]
     baseline = await tool.execute({"url": baseline_url, "method": method}, context)
     bl_status = baseline.get("status_code", 0)
     baseline_body = baseline.get("body", "") or ""
@@ -594,7 +611,7 @@ async def _execute_batch_inject(params: dict, context: ExecutionContext, registr
     results = []
     anomalies = []
     for payload in payloads[:8]:
-        req_params = _build_inject_url(url, param, str(payload), method)
+        req_params = _build_inject_url(url, param, str(payload), method, form_fields=form_fields)
         r = await tool.execute(req_params, context)
         r_status = r.get("status_code", 0)
         r_body = r.get("body", "") or ""
@@ -730,6 +747,8 @@ async def _execute_probe_filter(params: dict, context: ExecutionContext, registr
     """探测过滤规则"""
     url = params.get("url", "")
     param = params.get("param", "")
+    method = params.get("method", "GET")
+    form_fields = params.get("form_fields") or []
     chars = params.get("chars", ["<", ">", "'", '"', "/", "\\", ";", "|", "(", ")", "{", "}"])
 
     if not url or not param:
@@ -739,15 +758,15 @@ async def _execute_probe_filter(params: dict, context: ExecutionContext, registr
     blocked = []
     allowed = []
 
-    # 先发一个 baseline 请求
-    baseline_params = _build_inject_url(url, param, "normaltest123", "GET")
+    # 先发一个 baseline 请求 (用端点能力 method/form_fields, L2/PR-3)
+    baseline_params = _build_inject_url(url, param, "normaltest123", method, form_fields=form_fields)
     baseline_result = await tool.execute(baseline_params, context)
     baseline_status = baseline_result.get("status_code", 0)
     baseline_body_len = len(baseline_result.get("body", ""))
 
     for char in chars[:12]:
         test_value = f"test{char}probe"
-        req = _build_inject_url(url, param, test_value, "GET")
+        req = _build_inject_url(url, param, test_value, method, form_fields=form_fields)
         result = await tool.execute(req, context)
 
         test_status = result.get("status_code", 0)
@@ -804,6 +823,7 @@ async def _execute_sqli_detect(params: dict, context: ExecutionContext, registry
         "url": clean_url,
         "param": param,
         "method": method,
+        "form_fields": params.get("form_fields") or [],
     }, context)
 
     if not result.get("success"):
