@@ -426,81 +426,127 @@ async def _run_reconnaissance(state: VulnHuntState) -> dict:
         recon_results["errors"].append(f"dir_scan: {dir_result.get('error', 'unknown')}")
         recon_results["tool_health"]["dir_scan"] = f"failed:{dir_result.get('error', 'unknown')[:40]}"
 
-    # 处理首页请求结果 — 三层回退提取 (P0-2)
+    # 处理首页请求结果 — 并行收集 + 强制构建
     homepage_result = results[1]
-    all_links = []
+    all_links_set: set[str] = set()
+    all_forms: list[dict] = []
+    all_params: list[dict] = []
     body = ""
-    forms = []
-    params = []
+    hp_status = 0
+    hp_headers: dict = {}
+
+    # 来源 1: http_request 工具
     if isinstance(homepage_result, dict) and homepage_result.get("success"):
         body = homepage_result.get("body", "") or ""
-        links = _extract_links(body)
-        all_links = links[:]
-        forms = _extract_forms(body)
-        params = _extract_params_from_links(links)
-        logger.info("Layer1 工具: %d links, %d forms", len(links), len(forms))
-    # Layer 2: httpx 直连回退
-    if not all_links:
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-                resp = await client.get(target_url)
-                if resp.status_code == 200:
+        hp_status = homepage_result.get("status_code", 0)
+        hp_headers = homepage_result.get("headers", {}) or {}
+        l1 = _extract_links(body) if body else []
+        all_links_set.update(l1)
+        if body:
+            all_forms.extend(_extract_forms(body))
+            all_params.extend(_extract_params_from_links(l1))
+        logger.info("来源1 工具: %d links, %d forms", len(l1), len(all_forms))
+        recon_results["tool_health"]["http"] = "ok"
+    elif isinstance(homepage_result, dict):
+        recon_results["errors"].append(f"http_request: {homepage_result.get('error', 'unknown')}")
+        recon_results["tool_health"]["http"] = f"failed:{homepage_result.get('error', 'unknown')[:40]}"
+
+    # 来源 2: httpx 直连 (始终执行, 补充工具层可能遗漏的链接)
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(target_url)
+            if resp.status_code == 200:
+                if not body:
                     body = resp.text
-                    links = _extract_links(body)
-                    all_links = links[:]
-                    forms = _extract_forms(body)
-                    params = _extract_params_from_links(links)
-                    logger.info("Layer2 httpx: %d links, %d forms (status=%d)",
-                                len(links), len(forms), resp.status_code)
-        except Exception as e:
-            logger.warning("Layer2 httpx 失败: %s", e)
-    # Layer 3: Playwright 渲染回退
-    if not all_links:
+                    hp_status = resp.status_code
+                    hp_headers = dict(resp.headers)
+                l2 = _extract_links(resp.text)
+                all_links_set.update(l2)
+                all_forms.extend(_extract_forms(resp.text))
+                all_params.extend(_extract_params_from_links(l2))
+                logger.info("来源2 httpx: %d links (total unique: %d)", len(l2), len(all_links_set))
+    except Exception as e:
+        logger.warning("来源2 httpx 失败: %s", e)
+
+    # 来源 3: Playwright DOM 渲染 (links 少时)
+    if len(all_links_set) < 20:
         try:
             from app.core.playwright_manager import get_browser
             browser = get_browser()
             bctx = await browser.new_context(ignore_https_errors=True)
             page = await bctx.new_page()
-            await page.goto(target_url, wait_until="networkidle", timeout=15000)
-            body = await page.content()
-            links = _extract_links(body)
-            all_links = links[:]
-            forms = _extract_forms(body)
-            params = _extract_params_from_links(links)
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
+            pw_body = await page.content()
+            l3 = _extract_links(pw_body)
+            all_links_set.update(l3)
+            all_forms.extend(_extract_forms(pw_body))
+            all_params.extend(_extract_params_from_links(l3))
             await bctx.close()
-            logger.info("Layer3 Playwright: %d links, %d forms", len(links), len(forms))
+            logger.info("来源3 Playwright DOM: %d links (total unique: %d)", len(l3), len(all_links_set))
             recon_results["tool_health"]["playwright"] = "ok"
+            if not body:
+                body = pw_body
         except Exception as e:
-            logger.warning("Layer3 Playwright 失败: %s", e)
+            logger.warning("来源3 Playwright 失败: %s", e)
             recon_results["tool_health"]["playwright"] = f"unavailable:{str(e)[:40]}"
-    # 构建 homepage_info
-    if all_links:
-        categorized = _classify_and_score_links(links)
-        scored_links = []
-        for cat_items in categorized.values():
-            scored_links.extend(cat_items)
-        scored_links.sort(key=lambda x: x["score"], reverse=True)
-        top_scored_paths = [item["link"] for item in scored_links[:60]]
-        smart_snippets = _extract_smart_body_snippets(body) if body else []
-        recon_results["homepage_info"] = {
-            "status_code": homepage_result.get("status_code") if isinstance(homepage_result, dict) else 200,
-            "headers": homepage_result.get("headers", {}) if isinstance(homepage_result, dict) else {},
-            "body_preview": body[:3000] if body else "",
-            "smart_snippets": smart_snippets,
-            "links": top_scored_paths[:50],
-            "categorized_links": {cat: items[:15] for cat, items in categorized.items()},
-            "total_links": len(links),
-            "forms_count": len(forms),
-            "params_count": len(params),
-        }
-        recon_results["forms"] = forms
-        recon_results["parameters"] = params
+
+    # 来源 4: Playwright JS 直接提取 (终极兜底, links < 5 时)
+    if len(all_links_set) < 5:
+        try:
+            from app.core.playwright_manager import get_browser
+            browser = get_browser()
+            bctx = await browser.new_context(ignore_https_errors=True)
+            page = await bctx.new_page()
+            await page.goto(target_url, wait_until="networkidle", timeout=20000)
+            js_links = await page.evaluate("""() => {
+                const links = new Set();
+                document.querySelectorAll('a[href]').forEach(a => {
+                    const href = a.getAttribute('href');
+                    if (href && !href.startsWith('javascript:') && !href.startsWith('#') && href.length > 1)
+                        links.add(href);
+                });
+                document.querySelectorAll('form[action]').forEach(f => {
+                    const action = f.getAttribute('action');
+                    if (action && action.length > 1) links.add(action);
+                });
+                return [...links];
+            }""")
+            all_links_set.update(js_links or [])
+            await bctx.close()
+            logger.info("来源4 Playwright JS: %d links (total unique: %d)", len(js_links or []), len(all_links_set))
+        except Exception as e:
+            logger.warning("来源4 Playwright JS 失败: %s", e)
+
+    # 强制构建 homepage_info — 即使链接少也构建
+    all_links = list(all_links_set)
+    categorized = _classify_and_score_links(all_links) if all_links else {}
+    scored_links = []
+    for cat_items in categorized.values():
+        scored_links.extend(cat_items)
+    scored_links.sort(key=lambda x: x["score"], reverse=True)
+    top_scored_paths = [item["link"] for item in scored_links[:60]]
+    smart_snippets = _extract_smart_body_snippets(body) if body else []
+
+    recon_results["homepage_info"] = {
+        "status_code": hp_status or (homepage_result.get("status_code") if isinstance(homepage_result, dict) else 0),
+        "headers": hp_headers or (homepage_result.get("headers", {}) if isinstance(homepage_result, dict) else {}),
+        "body_preview": body[:3000] if body else "",
+        "smart_snippets": smart_snippets,
+        "links": top_scored_paths[:50],
+        "categorized_links": {cat: items[:15] for cat, items in categorized.items()},
+        "total_links": len(all_links),
+        "forms_count": len(all_forms),
+        "params_count": len(all_params),
+    }
+    recon_results["forms"] = all_forms
+    recon_results["parameters"] = all_params
+    if isinstance(homepage_result, dict) and homepage_result.get("success"):
         recon_results["tools_run"].append("http_request")
-        recon_results["tool_health"]["http"] = "ok"
-    elif isinstance(homepage_result, dict):
-        recon_results["errors"].append(f"http_request: {homepage_result.get('error', 'unknown')}")
-        recon_results["tool_health"]["http"] = f"failed:{homepage_result.get('error', 'unknown')[:40]}"
+
+    logger.info("首页提取完成: %d links, %d forms, %d params (categorized: %s)",
+                len(all_links), len(all_forms), len(all_params),
+                {cat: len(items) for cat, items in categorized.items()})
 
     # Katana 爬取结果处理 (results[2], 与 dir_scan + http_request 并行)
     katana_result = results[2] if len(results) > 2 else None

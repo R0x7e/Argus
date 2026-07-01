@@ -265,6 +265,33 @@ async def lats_recon_node(state: dict) -> dict:
             if not any(item.get("link") == action for item in cat_links["form_handler"]):
                 cat_links["form_handler"].append({"link": action, "score": 0.75})
 
+    # P2: 将 PCE 发现的所有 URL 合并到 homepage_info.links 并重新分类
+    homepage = recon_results.get("homepage_info", {})
+    existing_links = set(str(l) for l in homepage.get("links", []))
+    for page in recon_results.get("crawled_pages", []):
+        url = page.get("url", "") if isinstance(page, dict) else str(page)
+        if url and url not in existing_links:
+            existing_links.add(url)
+    for p in recon_results.get("parameters", []):
+        url = p.get("url", "") if isinstance(p, dict) else ""
+        if url and url not in existing_links:
+            existing_links.add(url)
+    if existing_links:
+        all_merged = list(existing_links)
+        from app.agents.nodes.orchestrator import _classify_and_score_links
+        merged_categorized = _classify_and_score_links(all_merged)
+        homepage["categorized_links"] = {cat: items[:15] for cat, items in merged_categorized.items()}
+        scored = []
+        for cat_items in merged_categorized.values():
+            scored.extend(cat_items)
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        homepage["links"] = [item["link"] for item in scored[:50]]
+        homepage["total_links"] = len(all_merged)
+        recon_results["homepage_info"] = homepage
+        logger.info("P2 链接合并: %d links → %d categorized types (%d vuln)",
+                    len(all_merged), len(merged_categorized),
+                    len(merged_categorized.get("vuln_page", [])))
+
     # P0: 工具驱动攻击面构造 — 替代 LLM
     from app.agents.lats.attack_surface_builder import build_attack_surface
     surface = await build_attack_surface(recon_results, target_url, task_id)
