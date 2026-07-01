@@ -30,6 +30,7 @@ from .browser_interact import BrowserInteractTool
 from .proxy_flows import ProxyFlowsTool
 from .deep_crawl import DeepCrawlTool
 from .run_poc import RunPocTool
+from .katana_crawler import KatanaCrawlerTool
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ def _register_all_tools() -> None:
         BrowserInteractTool(),   # L2: 浏览器交互
         ProxyFlowsTool(),        # L0: 代理流量查询
         DeepCrawlTool(),         # L0: 深度爬虫
+        KatanaCrawlerTool(),     # L0: Katana 端点头less爬虫
         RunPocTool(),            # L2: PoC 沙箱执行
     ]
 

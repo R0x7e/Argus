@@ -403,9 +403,14 @@ async def _run_reconnaissance(state: VulnHuntState) -> dict:
         "playwright": "unknown", "http": "unknown",
     }
 
+    # 审计修正: Katana 与 dir_scan + http_request 并行执行
     tasks = [
         _run_recon_tool("dir_scan", {"base_url": scan_origin}, context),
         _run_recon_tool("http_request", {"url": target_url, "method": "GET"}, context),
+        _run_recon_tool("katana_crawl", {
+            "url": target_url, "depth": 2, "headless": True,
+            "max_count": 200, "timeout": 90,
+        }, context),
     ]
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -496,6 +501,69 @@ async def _run_reconnaissance(state: VulnHuntState) -> dict:
     elif isinstance(homepage_result, dict):
         recon_results["errors"].append(f"http_request: {homepage_result.get('error', 'unknown')}")
         recon_results["tool_health"]["http"] = f"failed:{homepage_result.get('error', 'unknown')[:40]}"
+
+    # Katana 爬取结果处理 (results[2], 与 dir_scan + http_request 并行)
+    katana_result = results[2] if len(results) > 2 else None
+    if isinstance(katana_result, dict) and katana_result.get("success"):
+        katana_urls = katana_result.get("urls", [])
+        katana_forms = katana_result.get("forms", [])
+        katana_js = katana_result.get("js_endpoints", [])
+        katana_params = katana_result.get("params", [])
+
+        # 注入 URL 到 crawled_pages
+        for kurl in katana_urls[:150]:
+            existing = [p for p in recon_results.get("crawled_pages", [])
+                        if (isinstance(p, dict) and p.get("url") == kurl)]
+            if not existing:
+                recon_results.setdefault("crawled_pages", [])
+                recon_results["crawled_pages"].append({"url": kurl, "source": "katana"})
+
+        # 注入 JS 端点到 homepage_info.categorized_links (标准化后)
+        if katana_js:
+            homepage = recon_results.get("homepage_info", {})
+            cat_links = homepage.setdefault("categorized_links", {})
+            cat_links.setdefault("api_endpoint", [])
+            for js_ep in katana_js[:30]:
+                # URL 标准化
+                from urllib.parse import urljoin as _urljoin
+                norm_ep = _urljoin(target_url, js_ep)
+                if not any(item.get("link") == norm_ep for item in cat_links["api_endpoint"]):
+                    cat_links["api_endpoint"].append({"link": norm_ep, "score": 0.85})
+
+        # 注入表单 (去重合并)
+        for kf in katana_forms[:20]:
+            existing = [f for f in recon_results.get("forms", [])
+                        if f.get("action") == kf.get("action")]
+            if not existing:
+                recon_results.setdefault("forms", [])
+                recon_results["forms"].append({
+                    "action": kf["action"],
+                    "method": kf.get("method", "GET"),
+                    "params": kf.get("inputs", []),
+                    "source": "katana",
+                })
+
+        # 注入参数名
+        for pname in katana_params:
+            recon_results.setdefault("parameters", [])
+            if not any(isinstance(p, dict) and p.get("name") == pname
+                       for p in recon_results["parameters"]):
+                recon_results["parameters"].append({
+                    "name": pname, "url": target_url, "source": "katana",
+                })
+
+        recon_results["tools_run"].append("katana_crawl")
+        recon_results["tool_health"]["katana"] = "ok"
+        logger.info(
+            "Katana: %d URLs, %d JS endpoints, %d forms 注入",
+            len(katana_urls), len(katana_js), len(katana_forms),
+        )
+    elif isinstance(katana_result, dict):
+        recon_results["tool_health"]["katana"] = f"failed:{katana_result.get('error', 'unknown')[:40]}"
+        logger.warning("Katana 失败 (非致命): %s", katana_result.get("error", "unknown")[:200])
+    elif isinstance(katana_result, Exception):
+        recon_results["tool_health"]["katana"] = f"exception:{str(katana_result)[:40]}"
+        logger.warning("Katana 异常 (非致命): %s", str(katana_result)[:200])
     # === 第二层：递归抓取发现的链接（P0: 评分排序优先爬取高分端点, 最多 15 个） ===
     crawl_targets = []
     base_parsed = urlparse(target_url)
@@ -505,7 +573,12 @@ async def _run_reconnaissance(state: VulnHuntState) -> dict:
         elif link.startswith("http"):
             full_url = link
         else:
-            full_url = f"{target_url.rstrip('/')}/{link}"
+            # v2/L1-P1c: 用 urljoin 规范相对路径解析 — 治 R3 源头。
+            # 旧实现 f"{target_url.rstrip('/')}/{link}" 直接拼, 产生
+            # rce_ping.php/../../vul/x.php 这类 bogus 双重路径。
+            # urljoin 会正确处理 . / .. / 当前 path。
+            from urllib.parse import urljoin
+            full_url = urljoin(target_url, link)
         if base_parsed.netloc not in full_url:
             continue
         if re.search(r'\.(css|js|png|jpg|jpeg|gif|svg|ico|woff|ttf|pdf|zip)$', full_url, re.I):

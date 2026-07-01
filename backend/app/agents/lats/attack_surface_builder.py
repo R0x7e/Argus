@@ -258,6 +258,11 @@ async def build_attack_surface(
                         existing.setdefault("form_fields", []).append(_f)
 
     # ── P3 Step 2.5: 从 URL 文件名推断参数 ──
+    # v2/L1-P1d: hint 与真实表单字段冲突仲裁 — 真实表单字段优先。
+    # 旧实现把 rce_ping 的 hint ["ipaddress","cmd","ping"] 全注入,
+    # 与真实表单 ipaddress 混入不存在的 cmd/ping, 污染 Level0 探测。
+    # 改为: hint 仅对无表单字段(source != "form" 且 form_fields 为空)的端点触发,
+    # 且打上 param_source="url_hint" 标签, 由探针层降级使用。
     _URL_PARAM_HINTS = {
         "sqli_id": ["id"], "sqli_str": ["name", "id"], "sqli_search": ["name", "keyword"],
         "rce_ping": ["ipaddress", "cmd", "ping"], "rce_eval": ["txt", "cmd"],
@@ -271,6 +276,11 @@ async def build_attack_surface(
         "unsafedownload": ["filename"], "overpermission": ["username", "password"],
     }
     for path, ep in merged.items():
+        # 真实表单字段优先 — 有表单字段的端点跳过 hint 注入
+        existing_form_fields = ep.get("form_fields", []) or []
+        has_form_source = "form" in (ep.get("sources", []) or [])
+        if existing_form_fields or has_form_source:
+            continue  # 真实表单已提供参数, 不再注入 hint
         path_lower = path.lower()
         for hint_pattern, param_names in _URL_PARAM_HINTS.items():
             if hint_pattern in path_lower:

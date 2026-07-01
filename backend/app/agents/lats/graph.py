@@ -106,6 +106,8 @@ class LATSState(TypedDict):
     # v21: HDE 架构 — 端点聚焦探索模式
     exploration_mode: str  # "tree"(默认,MCTS) | "endpoint"(新HDE)
     endpoint_explorer: Any  # EndpointExplorer 实例(仅 endpoint 模式使用)
+    # v2/L3-P3b: rescue 次数追踪
+    rescue_count: int
 
 
 # ──── Node: Recon ────
@@ -350,33 +352,13 @@ async def lats_recon_node(state: dict) -> dict:
 # ──── v5: URL 语义解析 — 从 URL 路径推断参数和漏洞类型 ────
 
 def _infer_vuln_from_path(path: str) -> list[str]:
-    """从 URL 路径名推断可能的漏洞类型，不依赖参数发现 (P6: 配置路径约束)"""
-    path_lower = path.lower()
+    """从 URL 路径名推断可能的漏洞类型，不依赖参数发现 (P6: 配置路径约束)
 
-    # P6: 配置/版本控制路径 → 仅 info_disclosure
-    if _is_config_path(path):
-        return ["info_disclosure"]
-
-    types = []
-    kw_map = {
-        "sqli": "sql_injection", "sql": "sql_injection",
-        "xss": "xss", "cross": "xss",
-        "upload": "file_upload", "file": "lfi",
-        "admin": "auth_bypass", "manage": "auth_bypass",
-        "api": "idor", "search": "xss", "query": "sql_injection",
-        "login": "auth_bypass", "signin": "auth_bypass", "auth": "auth_bypass",
-        "redirect": "open_redirect", "callback": "ssrf",
-        "download": "path_traversal", "exec": "rce", "cmd": "rce",
-        "burteforce": "auth_bypass", "bf_": "auth_bypass",
-        "user": "idor", "account": "idor", "order": "idor",
-        "overpermission": "idor", "idor": "idor",
-    }
-    for kw, vt in kw_map.items():
-        if kw in path_lower and vt not in types:
-            types.append(vt)
-    if not types:
-        types = ["info_disclosure", "auth_bypass"]
-    return types
+    v2/L1-P1a: 委托给 path_semantics 单一真相源 — 治 R2 (原 kw_map 缺 "rce"
+    关键字, 导致 /vul/rce/rce_ping.php 推不出 rce)。
+    """
+    from app.agents.lats.path_semantics import infer_vuln_from_path as _infer
+    return _infer(path)
 
 
 def _is_endpoint_injectable(path: str) -> bool:
@@ -412,11 +394,12 @@ _VERSION_CONTROL_RE = re.compile(r'\.(git|svn|hg|bzr)(?:[/.]|$)')
 
 
 def _is_config_path(path: str) -> bool:
-    """P6: 判断是否为配置/静态文件路径 (仅允许 info_disclosure)"""
-    path_lower = path.lower()
-    if _VERSION_CONTROL_RE.search(path_lower):
-        return True
-    return any(p in path_lower for p in _CONFIG_PATH_PATTERNS_V2)
+    """P6: 判断是否为配置/静态文件路径 (仅允许 info_disclosure)
+
+    v2/L1-P1a: 委托给 path_semantics 单一真相源。
+    """
+    from app.agents.lats.path_semantics import is_config_path
+    return is_config_path(path)
 
 
 # ──── P1: 端点预验证 ────
@@ -776,13 +759,13 @@ async def lats_init_tree_node(state: dict) -> dict:
     # L2/PR-3 修复: 单页模式不能直接丢弃 attack_surface — 否则会丢掉表单来源的
     # http_method(POST) 与完整 form_fields, 导致 Level0 探针回退 GET 永远打不到 POST-only 注入点。
     # 改为: 从 attack_surface 中查找与目标路径匹配的端点, 继承其 method/form_fields/params。
+    # 默认端点能力 (对 full_site 模式也适用)
+    _cap_method = "GET"
+    _cap_form_fields: list[str] = []
+    _cap_params: list[str] = []
+
     if scan_mode == "single_page":
-        # 已规范化的目标路径 (与 attack_surface 端点 path 同源)
         _norm_target_path = target_path or "/"
-        # 从 attack_surface 收集同一端点的能力 (method/form_fields/params), 取表单来源优先
-        _cap_method = "GET"
-        _cap_form_fields: list[str] = []
-        _cap_params: list[str] = []
         # L2-fix: 优先从 attack_surface["forms"] 直接查表单 — forms 是 ground truth,
         # 攻击面 endpoint 合并时 method/form_fields 易被无关来源覆盖成 GET/空。
         for _fm in attack_surface.get("forms", []) or []:
@@ -852,9 +835,15 @@ async def lats_init_tree_node(state: dict) -> dict:
         endpoints_to_process = single_endpoints
         # L2/PR-3 修复: 单页目标默认视为可达 (它是任务目标), 并把表单能力写入
         # endpoint_meta_cache, 使主循环不因 accessibility=unknown 而整端点跳过。
+        # v2/L0-P0b: 缓存 key 必须用 normalize 后的 path — 治 R1。
+        # 旧实现 _sp = _se.get("path") 可能是完整 URL (target_url.split("?")[0]),
+        # 而主循环 normalize_endpoint_path 后用纯 path 查找 → miss → 整端点跳过。
+        from app.agents.lats.endpoint_normalizer import normalize_endpoint_path as _nep
         for _se in single_endpoints:
-            _sp = _se.get("path", "")
+            _sp_raw = _se.get("path", "")
+            _sp = _nep(_sp_raw) or _sp_raw
             if _sp:
+                _se["path"] = _sp  # 同步回写, 保证主循环与 cache key 一致
                 endpoint_meta_cache[_sp] = {
                     "accessibility": "accessible",
                     "status": 200,
@@ -894,6 +883,20 @@ async def lats_init_tree_node(state: dict) -> dict:
         meta = endpoint_meta_cache.get(path, {})
         accessibility = meta.get("accessibility", "unknown")
         is_config = meta.get("is_config_path", _is_config_path(path))
+        # v2/L1-P1b: fail-open — 对任务目标端点和表单来源端点, 预验证缺失
+        # 不等于不可达 (治 R1: 一个 cache miss 整端点跳过)。
+        # 仅对 dir_scan/crawled_page 来源的端点仍要求预验证通过。
+        if accessibility == "unknown" and source in ("target_url", "form",
+                                                       "page_extraction", "playwright",
+                                                       "http_fallback"):
+            accessibility = "accessible"
+            try:
+                await emit(task_id, "lats_init", "capability_fallback_used", {
+                    "endpoint": path, "source": source,
+                    "reason": "meta_cache_miss_fail_open",
+                })
+            except Exception:
+                pass
         allowed_vulns = _get_allowed_vuln_types(accessibility, is_config, path)
         # allowed_vulns 为 [] 表示完全跳过此端点
         if allowed_vulns is not None and len(allowed_vulns) == 0:
@@ -1305,6 +1308,25 @@ async def lats_react_execute_node(state: dict) -> dict:
                 low_signal_count += 1
             else:
                 node.empirical_value = 0.0
+
+            # v2/L4-P4b: 节点级诊断卡片 — 每个被探测的 SEED 输出可观测事件
+            _meta = node.endpoint_metadata or {}
+            _sig_matches = pr.signals.get("_signal_matches", [])
+            _sig_summary = [{"type": m.type, "conf": m.confidence, "vt": m.vuln_type} for m in _sig_matches[:3]]
+            try:
+                await emit(task_id, "lats_react", "node_diagnostic", {
+                    "node_id": node.id[:8], "path": node.state.current_endpoint,
+                    "http_method": _meta.get("http_method", "GET"),
+                    "form_fields": _meta.get("form_fields", []),
+                    "param": node.state.current_param, "vuln_type": node.state.vuln_type,
+                    "probe_count": len(node.probe_results), "verdict": pr.verdict,
+                    "kill_reason": pr.error if pr.verdict == "killed" else "",
+                    "signals_matched": _sig_summary,
+                    "baseline_length": pr.baseline_length, "inject_length": pr.inject_length,
+                    "reachable": _meta.get("reachable", False),
+                })
+            except Exception:
+                pass
 
         await emit(task_id, "lats_react", "level0_probe_complete", {
             "total": len(seed_nodes), "promoted": promoted_count,
@@ -1727,25 +1749,52 @@ async def lats_evaluate_node(state: dict) -> dict:
 
 # ──── Routing (v2) ────
 
+# v2/L3-P3a: 最小 dry gate — 至少 2 个 dry cycle 才允许直接报告,
+# 避免 cycle1 全 killed 即转报告 (治 R5)。rescue 节点在此期间重建攻击面。
+MIN_DRY_BEFORE_REPORT = 2
+
+
 def route_from_evaluate(state: dict) -> str:
-    """评估节点的路由决策 (v2: 考虑新状态 + Graveyard 复活)"""
+    """评估节点的路由决策 (v2: dry gate + rescue + Graveyard 复活)
+
+    v2/L3-P3a: 新增 MIN_DRY_BEFORE_REPORT 门禁 — dry_cycles < 阈值时
+    不直接报告, 改走 rescue 重建攻击面 (治 R5: cycle1 全 killed 即报告)。
+    v2/L3-P3b: 新增 rescue 路由分支。
+    """
     tree = state.get("search_tree")
     cycle = int(state.get("current_cycle", 0) or 0)
     max_cycles = int(state.get("max_cycles", 15) or 15)
     dry_cycles = int(state.get("dry_cycles", 0) or 0)
     bb = state.get("blackboard")
     expansion_stats = state.get("expansion_stats") or {}
+    # v2/L3-P3b: rescue 次数追踪
+    rescue_count = int(state.get("rescue_count", 0) or 0)
+    rescue_cap = 2  # rescue 最多 2 次
 
+    # 硬上限: 达到最大周期 → 报告
     if cycle >= max_cycles:
         logger.info("达到最大搜索周期 (%d)，进入报告", max_cycles)
         return "reporter"
 
-    if tree and tree.all_explored():
-        if tree.graveyard and expansion_stats.get("resurrected", 0) > 0:
-            logger.info("Graveyard 中有节点被复活，继续搜索")
-            return "continue"
-        logger.info("搜索树已全部探索，进入报告")
-        return "reporter"
+    # v2/L3-P3a: dry gate — 全树探索完但 dry 不足 + 有可救节点 → rescue
+    if tree:
+        all_done, has_resurrectable = tree._exploration_status()
+        if all_done:
+            # Graveyard 有可救节点且未用完 rescue 配额 → continue (复活)
+            if has_resurrectable and expansion_stats.get("resurrected", 0) > 0:
+                logger.info("Graveyard 中有节点被复活，继续搜索")
+                return "continue"
+            # dry 不足 + rescue 配额未满 → rescue 重建攻击面 (治 R5)
+            budget_exhausted = cycle >= max_cycles * 0.8
+            if (dry_cycles < MIN_DRY_BEFORE_REPORT
+                    and rescue_count < rescue_cap
+                    and not budget_exhausted):
+                logger.info("全树探索完但 dry_cycles=%d < %d, 进入 rescue (第 %d 次)",
+                            dry_cycles, MIN_DRY_BEFORE_REPORT, rescue_count + 1)
+                return "rescue"
+            logger.info("搜索树已全部探索 (dry=%d, rescue=%d/%d)，进入报告",
+                        dry_cycles, rescue_count, rescue_cap)
+            return "reporter"
 
     if dry_cycles >= 3:
         max_val = tree.max_unexplored_value() if tree else 0
@@ -1771,6 +1820,123 @@ def route_from_evaluate(state: dict) -> str:
     return "continue"
 
 
+async def lats_rescue_node(state: dict) -> dict:
+    """v2/L3-P3b: 救援节点 — 全树 dry 时重建攻击面/重播种 POST SEED。
+
+    触发条件 (route_from_evaluate 返回 "rescue"):
+    1. dry_cycles≥1 且 explored==0 且 findings==0 (RCE 任务正是此情形)
+    2. dry_cycles≥2 且 new_branches==0 且 budget>40%
+
+    动作:
+    1. 重新侦察 — 对 reachable 端点用纯 HTTP 表单解析器重抓 forms/params
+    2. 方法论切换 — 对 reachable 端点按 http_method 维度重建 SEED (补 POST SEED)
+    3. 定向注入 — 跳过 Level0, 直接用 SignalDetector 梯度载荷集
+    4. 重播种带 cap — rescue 最多 2 次, 总新增分支 ≤ 6
+    """
+    tree: SearchTree = state["search_tree"]
+    bb = state["blackboard"]
+    task_id = state["task_id"]
+    task_config = state.get("task_config", {}) or {}
+    target_url = bb.target_profile.get("base_url", "") if bb.target_profile else ""
+    focus_vuln_types = bb.focus_vuln_types or task_config.get("focus_vuln_types", [])
+    rescue_count = int(state.get("rescue_count", 0) or 0)
+
+    await emit(task_id, "lats_rescue", "agent_started", {
+        "node": "rescue", "rescue_count": rescue_count + 1,
+        "findings": len(bb.findings),
+    })
+
+    # 动作 1: 重新侦察 — 重抓目标页表单 (Level0 可能因 GET 误判错过 POST 表单)
+    new_branches = 0
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True, verify=False) as client:
+            resp = await client.get(target_url)
+            if resp.status_code == 200 and resp.text:
+                from app.agents.nodes.orchestrator import _extract_forms
+                re_forms = _extract_forms(resp.text)
+                for fm in re_forms:
+                    action = fm.get("action", "") or target_url
+                    if action.startswith("http"):
+                        from urllib.parse import urlparse as _pu
+                        _ap = _pu(action)
+                        action = _ap.path or "/"
+                    method = str(fm.get("method", "GET")).upper()
+                    fields = fm.get("form_fields") or fm.get("params") or []
+                    if not fields:
+                        continue
+                    # 动作 2: 为每个表单字段重建 SEED (POST 优先)
+                    from app.agents.lats.path_semantics import infer_vuln_from_param
+                    root = tree.get_root()
+                    if root is None:
+                        break
+                    seen_keys = {f"{n.state.vuln_type}@{action}:{p}"
+                                 for n in tree.nodes.values() if n.state.current_endpoint == action}
+                    for field in fields[:3]:
+                        inferred_types = infer_vuln_from_param(field)
+                        if focus_vuln_types:
+                            inferred_types = [vt for vt in inferred_types if vt in focus_vuln_types] or inferred_types[:1]
+                        for vt in inferred_types[:2]:
+                            bk = f"{vt}@{action}:{field}"
+                            if bk in seen_keys:
+                                continue
+                            seen_keys.add(bk)
+                            child = tree.create_child_node(
+                                parent=root, action="rescue_reseed",
+                                action_params={"endpoint": action, "param": field, "vuln_type": vt},
+                                vuln_type=vt, endpoint=action, param=field,
+                                value_estimate=0.6, created_at_cycle=state.get("current_cycle", 0),
+                            )
+                            child.status = NodeStatus.SEED
+                            child.endpoint_metadata = {
+                                "accessibility": "accessible", "is_config_path": False,
+                                "status": 200, "http_method": method,
+                                "form_fields": list(fields), "reachable": True,
+                            }
+                            new_branches += 1
+                            if new_branches >= 6:  # 重播种 cap
+                                break
+                        if new_branches >= 6:
+                            break
+                    if new_branches >= 6:
+                        break
+    except Exception as e:
+        logger.warning("rescue 重新侦察失败: %s", str(e)[:120])
+
+    # 动作 3: 从 graveyard 复活 reachable 节点
+    resurrected = 0
+    for nid, node in list(tree.graveyard.items()):
+        if (node.endpoint_metadata or {}).get("reachable", False) and resurrected < 3:
+            node.status = NodeStatus.SEED
+            node.probe_level = 0
+            node.probe_results = []
+            node.value_estimate = max(0.3, node.value_estimate)
+            del tree.graveyard[nid]
+            resurrected += 1
+
+    await emit(task_id, "lats_rescue", "rescue_complete", {
+        "new_branches": new_branches, "resurrected": resurrected,
+        "rescue_count": rescue_count + 1,
+    })
+
+    tree_stats = tree.stats()
+    logger.info("rescue 完成: %d 新分支, %d 复活 (total_nodes=%d)",
+                new_branches, resurrected, tree_stats.get("total_nodes", 0))
+
+    return {
+        "search_tree": tree,
+        "blackboard": bb,
+        "rescue_count": rescue_count + 1,
+        "events": [{
+            "id": str(uuid.uuid4()),
+            "agent": "lats_rescue",
+            "type": "rescue_complete",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "data": {"new_branches": new_branches, "resurrected": resurrected},
+        }],
+    }
+
+
 async def lats_pre_reporter_node(state: dict) -> dict:
     """桥接节点 — 将 LATS 状态映射为 reporter 兼容格式"""
     return {
@@ -1782,7 +1948,10 @@ async def lats_pre_reporter_node(state: dict) -> dict:
 # ──── Graph Builder (v2) ────
 
 def build_lats_graph():
-    """构建 LATS + ReAct + 动态扩展 + 知识库的 LangGraph 图"""
+    """构建 LATS + ReAct + 动态扩展 + 知识库的 LangGraph 图
+
+    v2/L3-P3b: 新增 rescue 节点 — 全树 dry 时重建攻击面/重播种 POST SEED。
+    """
     from app.agents.nodes.reporter import reporter_node
 
     graph = StateGraph(LATSState)
@@ -1793,6 +1962,7 @@ def build_lats_graph():
     graph.add_node("react_execute", lats_react_execute_node)
     graph.add_node("expand", lats_expand_node)  # v2
     graph.add_node("evaluate", lats_evaluate_node)
+    graph.add_node("rescue", lats_rescue_node)  # v2/L3-P3b: 救援节点
     graph.add_node("pre_reporter", lats_pre_reporter_node)
     graph.add_node("reporter", reporter_node)
 
@@ -1803,17 +1973,18 @@ def build_lats_graph():
     graph.add_edge("mcts_select", "react_execute")
     graph.add_edge("react_execute", "expand")  # v2: execute → expand
     graph.add_edge("expand", "evaluate")        # v2: expand → evaluate
+    graph.add_edge("rescue", "mcts_select")     # v2/L3-P3b: rescue → 重选
 
     graph.add_conditional_edges(
         "evaluate", route_from_evaluate,
-        {"continue": "mcts_select", "reporter": "pre_reporter"},
+        {"continue": "mcts_select", "rescue": "rescue", "reporter": "pre_reporter"},
     )
 
     graph.add_edge("pre_reporter", "reporter")
     graph.add_edge("reporter", END)
 
     compiled = graph.compile()
-    logger.info("LATS v2 漏洞挖掘图构建完成 (自适应选择 + 动态扩展 + 共享知识库)")
+    logger.info("LATS v2 漏洞挖掘图构建完成 (自适应选择 + 动态扩展 + 共享知识库 + rescue)")
     return compiled
 
 
@@ -1857,4 +2028,5 @@ def create_lats_initial_state(
         "current_phase": "initializing",
         "exploration_mode": exploration_mode,
         "endpoint_explorer": None,
+        "rescue_count": 0,  # v2/L3-P3b
     }

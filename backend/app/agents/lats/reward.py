@@ -170,39 +170,32 @@ def infer_vuln_types(
     """
     基于参数名和端点特征推断可能的漏洞类型 (v2: 集成 EndpointCapability)。
 
+    v2/L1-P1a: 参数名推断委托给 path_semantics.infer_vuln_from_param 单一真相源,
+    消除 reward.py 与 graph.py 两份关键字字典不一致的问题。
+    端点路径暗示仍由 path_semantics.infer_vuln_from_path 提供。
+
     当 capability 提供时，结果会被 capability.allowed_vuln_types 过滤。
     """
-    types = []
+    from app.agents.lats.path_semantics import (
+        infer_vuln_from_param, infer_vuln_from_path,
+    )
+
     p = (param_name or "").lower()
     if isinstance(endpoint, str):
         path = endpoint.lower()
     else:
         path = (endpoint.get("path", "") or "").lower()
 
-    # 参数名暗示
-    if p in ("id", "uid", "user_id", "account", "order_id", "profile_id"):
-        types.append("idor")
-    if p in ("url", "link", "redirect", "callback", "next", "return_to", "goto"):
-        types.extend(["ssrf", "open_redirect"])
-    if p in ("file", "path", "page", "include", "template", "doc", "load"):
-        types.extend(["lfi", "path_traversal"])
-    if p in ("q", "query", "search", "keyword", "name", "username", "sort", "order"):
-        types.extend(["xss", "sql_injection"])
-    if p in ("cmd", "exec", "command", "ping", "run"):
-        types.append("rce")
-    if p in ("template", "content", "message", "text"):
-        types.append("ssti")
-    # P4: upload params
-    if p in ("file", "upload", "image", "avatar"):
-        if "file_upload" not in types:
-            types.append("file_upload")
+    # 参数名暗示 — 单一真相源
+    types = infer_vuln_from_param(param_name)
 
     # 端点路径暗示
     if "admin" in path or "manage" in path:
         if "auth_bypass" not in types:
             types.append("auth_bypass")
     if "upload" in path:
-        types.append("file_upload")
+        if "file_upload" not in types:
+            types.append("file_upload")
     if "api" in path and not types:
         types.extend(["idor", "auth_bypass"])
 

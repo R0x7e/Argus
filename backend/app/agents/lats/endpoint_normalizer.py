@@ -110,12 +110,50 @@ def normalize_endpoint_path(raw_path: str) -> str | None:
             return None
 
     # Step 4: 路径长度检查
-    if len(path) < 2 and path != '/':
+    if len(path) < 2 and path != "/":
         return None
     if len(path) > 300:
         return None
 
-    return path
+    # Step 5 (v2/L0-P0a): 折叠 . 与 .. 段 — 治 R3 bogus 相对路径端点渗透。
+    # 旧实现不折叠 .., 导致 rce_ping.php/../../vul/sqli.php 这类端点原样保留。
+    folded = _fold_dot_segments(path)
+    if folded is None:
+        # 跨出 host root 或残留 .. 段 → 非法
+        return None
+    return folded
+
+
+def _fold_dot_segments(path: str) -> str | None:
+    """折叠 URL 路径中的 . 与 .. 段 (RFC 3986 §5.2.4 语义)。
+
+    返回 None 表示路径非法 (跨出 root 或残留 .. 段)。
+    与 endpoint_identity._fold_dot_segments 同源, 此处保留独立定义避免循环依赖。
+
+    使用显式栈而非 posixpath.normpath — normpath 在 root 处静默 clamp,
+    无法区分 "/a/../b" (合法) 与 "/../../etc/passwd" (跨出 root, 应拒绝)。
+    """
+    if not path:
+        return "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    segments = path.split("/")
+    stack: list[str] = []
+    escaped = False
+    for seg in segments[1:]:
+        if seg == "" or seg == ".":
+            continue
+        if seg == "..":
+            if stack:
+                stack.pop()
+            else:
+                escaped = True
+                break
+        else:
+            stack.append(seg)
+    if escaped:
+        return None
+    return "/" + "/".join(stack)
 
 
 def normalize_endpoints(endpoints: list) -> list[dict]:

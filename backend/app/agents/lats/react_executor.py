@@ -73,12 +73,16 @@ async def _maybe_record_to_knowledge(
     node,  # SearchNode
     step_idx: int,
     shared_knowledge=None,
+    task_id: str = "",  # v2/L4-P4a: 用于 emit 失败事件
 ) -> None:
     """P2-4: 从 Observation 中提取知识并写入节点状态 (供 expand 节点使用)
 
     L4-fix: 同时写入 SharedKnowledge 单例, 修复跨分支知识断流
     (旧实现 knowledge_stats 恒为 0)。
+    v2/L4-P4a: 异常不再静默吞 — emit knowledge_record_failed 事件,
+    治上轮 except:pass 让 RuntimeWarning 默默刷屏的问题。
     """
+    from app.agents.emit import emit
     try:
         # 1. 提取有效参数信息
         if observation.success and observation.tool_call:
@@ -99,8 +103,13 @@ async def _maybe_record_to_knowledge(
                                 endpoint=node.state.current_endpoint or "",
                                 context="query" if str(action_params.get("method", "")).upper() != "POST" else "body",
                             )
-                        except Exception:
-                            pass
+                        except Exception as _pe:
+                            if task_id:
+                                try:
+                                    await emit(task_id, "lats_react", "knowledge_record_failed",
+                                               {"field": "record_param", "error": str(_pe)[:120]})
+                                except Exception:
+                                    pass
 
         # 2. 提取 WAF/过滤规则
         if observation.filter_rules:
@@ -121,8 +130,13 @@ async def _maybe_record_to_knowledge(
                     )
                     if blocked:
                         shared_knowledge.waf_profile["detected"] = True
-                except Exception:
-                    pass
+                except Exception as _we:
+                    if task_id:
+                        try:
+                            await emit(task_id, "lats_react", "knowledge_record_failed",
+                                       {"field": "waf_profile", "error": str(_we)[:120]})
+                        except Exception:
+                            pass
 
         # 3. 提取错误信息泄露
         if observation.error_message_leaked and hasattr(node, 'state'):
@@ -155,11 +169,24 @@ async def _maybe_record_to_knowledge(
                                 evidence=fact[:200],
                                 source_node_id=node.id,
                             )
-                        except Exception:
-                            pass
+                        except Exception as _ve:
+                            if task_id:
+                                try:
+                                    await emit(task_id, "lats_react", "knowledge_record_failed",
+                                               {"field": "record_vuln_signal", "error": str(_ve)[:120]})
+                                except Exception:
+                                    pass
 
-    except Exception:
-        logger.debug("knowledge record skipped (non-fatal)")
+    except Exception as _ke:
+        # v2/L4-P4a: 不再静默 — emit 失败事件 (治 RuntimeWarning 默默刷屏)
+        logger.warning("knowledge record failed: %s", _ke)
+        if task_id:
+            try:
+                await emit(task_id, "lats_react", "knowledge_record_failed",
+                           {"field": "outer", "error": str(_ke)[:120],
+                            "node_id": getattr(node, 'id', '')})
+            except Exception:
+                pass
 
 async def react_agent_loop(
     node: SearchNode,
@@ -395,16 +422,13 @@ async def react_agent_loop(
         observation = await execute_action(action_str, action_params, context, state)
 
         # === v2: 记录到共享知识库 ===
-        try:
-            _sk = getattr(context, '_shared_knowledge', None)
-            await _maybe_record_to_knowledge(
-                observation, action_str, action_params, node, step_idx,
-                shared_knowledge=_sk,
-            )
-        except Exception as _ke:
-            # L4-fix: 旧实现把 async 函数同步调用 (返回 coroutine 未 await) 且
-            # 用裸 except:pass 静默 RuntimeWarning, 导致知识回路全断。
-            logger.warning("knowledge record failed: %s", _ke)
+        # v2/L4-P4a: 传入 task_id, 异常 emit knowledge_record_failed 而非静默
+        _sk = getattr(context, '_shared_knowledge', None)
+        await _maybe_record_to_knowledge(
+            observation, action_str, action_params, node, step_idx,
+            shared_knowledge=_sk,
+            task_id=getattr(context, 'task_id', ''),
+        )
 
         # === v17: 工具异常检测 ===
         if observation.success and not observation.new_info_gained:

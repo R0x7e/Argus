@@ -50,9 +50,11 @@ COPY tests/ /app/tests/
 # 安装测试依赖
 RUN /app/venv/bin/pip install --no-cache-dir pytest pytest-asyncio
 
-# 创建非 root 用户运行（安全加固）
+# 创建非 root 用户, 复制 Playwright Chromium 到 appuser 目录
 RUN useradd -r -s /bin/false -u 1000 appuser && \
-    chown -R appuser:appuser /app
+    mkdir -p /home/appuser/.cache && \
+    cp -r /root/.cache/ms-playwright /home/appuser/.cache/ms-playwright && \
+    chown -R appuser:appuser /app /home/appuser/.cache
 
 # 设置环境变量
 ENV PATH="/app/venv/bin:$PATH" \

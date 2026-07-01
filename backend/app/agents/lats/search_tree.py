@@ -395,7 +395,15 @@ class SearchTree:
         # 转报告, max_cycles 预算只用 1 轮。
         if node.id == self.root_id:
             return False
-        if node.visit_count >= 5 and node.total_reward <= 0:
+        # v2/L3-P3d: kill 阈值动态化 — reachable capability 端点 ≥10 探才允许剪,
+        # bogus/passthrough 端点 3 探即剪; dry_cycles≥2 收紧。
+        meta = node.endpoint_metadata or {}
+        reachable = meta.get("reachable", False)
+        # 基础访问次数阈值: reachable 端点更宽松
+        visit_cap = 10 if reachable else 5
+        if budget_ratio < 0.3:
+            visit_cap = max(3, visit_cap - 3)  # 预算紧张时收紧
+        if node.visit_count >= visit_cap and node.total_reward <= 0:
             return True
         if node.depth >= 15:
             return True
@@ -491,14 +499,46 @@ class SearchTree:
         self.findings.append(finding)
 
     def all_explored(self) -> bool:
+        """向后兼容: 返回是否所有激活态节点都已耗尽。
+
+        v2/L3-P3c: 新代码应使用 has_active_or_resurrectable() 区分
+        "应停止搜索" 与 "有可救节点"。
+        """
+        all_done, _resurrectable = self._exploration_status()
+        return all_done
+
+    def _exploration_status(self) -> tuple[bool, bool]:
+        """v2/L3-P3c: 拆分 all_explored 的两个语义。
+
+        Returns:
+            (all_done, has_resurrectable):
+            - all_done: 不存在任何激活态工作节点 (跳过 root 容器节点)
+            - has_resurrectable: graveyard 中存在 reachable capability 节点
+              (供 rescue 节点决策, 治 R5: 全树 dry→直接报告)
+        """
         root = self.get_root()
         if root is None:
-            return True
-        active = (NodeStatus.UNEXPLORED, NodeStatus.NEEDS_EXPANSION, NodeStatus.EXPLORING, NodeStatus.SEED, NodeStatus.PROBING, NodeStatus.PROMOTED, NodeStatus.HIGH_SIGNAL, NodeStatus.LOW_SIGNAL)
+            return True, False
+        active = (NodeStatus.UNEXPLORED, NodeStatus.NEEDS_EXPANSION, NodeStatus.EXPLORING,
+                  NodeStatus.SEED, NodeStatus.PROBING, NodeStatus.PROMOTED,
+                  NodeStatus.HIGH_SIGNAL, NodeStatus.LOW_SIGNAL)
         for node in self.nodes.values():
+            # 跳过 root 容器节点 (与 _collect_candidates 一致) — root 不是工作项
+            if node.id == self.root_id:
+                continue
             if node.status in active:
-                return False
-        return True
+                return False, False
+        # 无激活态 — 检查 graveyard 是否有可救节点 (reachable capability)
+        resurrectable = any(
+            (n.endpoint_metadata or {}).get("reachable", False)
+            for n in self.graveyard.values()
+        )
+        return True, resurrectable
+
+    def has_active_or_resurrectable_node(self) -> bool:
+        """v2/L3-P3b: 是否还有激活态或可救节点 (供 rescue 路由决策)。"""
+        all_done, resurrectable = self._exploration_status()
+        return (not all_done) or resurrectable
 
     def max_unexplored_value(self) -> float:
         max_val = 0.0

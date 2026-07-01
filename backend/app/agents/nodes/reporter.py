@@ -198,6 +198,7 @@ async def reporter_node(state: VulnHuntState) -> dict:
     }
 
     # L4-fix: 挖掘过程诊断 — 基于已知信息生成可解释项 (不依赖 LLM, 避免额外失败)
+    # v2/L4-P4c: 责任制失败定位 — 每条诊断必须能在事件流中找到对应证据。
     diagnosis: list[str] = []
     th = recon_data.get("tool_health", {}) or {}
     if th.get("playwright", "").startswith(("unavailable", "failed")):
@@ -208,6 +209,58 @@ async def reporter_node(state: VulnHuntState) -> dict:
         diagnosis.append("攻击面以 dir_scan 结果为主, 可能存在 PATH_INFO 误报, 建议核查端点可达性")
     if not bb.findings:
         diagnosis.append("未发现漏洞, 建议确认 POST-only 注入点是否被 Level0 探针覆盖")
+
+    # v2/L4-P4c: 基于 blackboard / search_tree / rescue 的责任制诊断
+    tree = state.get("search_tree")
+    if tree:
+        try:
+            ts = tree.stats()
+            total_nodes = ts.get("total_nodes", 0)
+            explored = ts.get("explored", 0)
+            killed = ts.get("killed", 0)
+            promoted = ts.get("promoted", 0)
+            findings_n = ts.get("findings", 0)
+            diagnosis.append(
+                f"搜索树: {total_nodes} 节点, 探索 {explored}, 杀死 {killed}, "
+                f"提升 {promoted}, 发现 {findings_n}"
+            )
+            if total_nodes > 0 and killed == total_nodes - 1 and findings_n == 0:
+                diagnosis.append(
+                    "责任制: 全部节点被 Level0 杀死且 0 发现 — 检查 capability 通道是否"
+                    "因 normalize/cache key 失配整端点跳过, 或 SignalDetector 漏掉反射信号"
+                )
+            if promoted == 0 and total_nodes > 3:
+                diagnosis.append(
+                    "责任制: 0 个节点被提升 — 检查探针是否用 POST method + 完整 form_fields, "
+                    "以及 RCE/XSS 反射信号是否被 SignalDetector 识别"
+                )
+        except Exception:
+            pass
+
+    # rescue / capability_fallback 诊断 (从 state 读取)
+    rescue_count = state.get("rescue_count", 0)
+    if rescue_count > 0:
+        diagnosis.append(f"rescue 节点触发 {rescue_count} 次 — 说明初始搜索树过早耗尽, 已尝试重建攻击面")
+
+    knowledge = getattr(bb, "shared_knowledge", None)
+    if knowledge:
+        try:
+            ks = knowledge.get_coverage_stats()
+            total_signals = ks.get("total_vuln_signals", 0)
+            accessible = ks.get("accessible_endpoints", 0)
+            total_eps = ks.get("total_endpoints", 0)
+            if total_eps > 0 and accessible == 0:
+                diagnosis.append(
+                    "责任制: 侦察端点 {0} 个但 0 可达 — fail-open 是否生效? 检查 source 白名单".format(total_eps)
+                )
+            if total_signals > 0 and findings_n == 0 if tree else False:
+                diagnosis.append(
+                    f"责任制: 知识库记录 {total_signals} 个漏洞信号但 0 个 finding — "
+                    "信号未被 ReAct 升级为确认漏洞, 检查 _maybe_record_to_knowledge 是否断流"
+                )
+        except Exception:
+            pass
+
     template_context["diagnosis"] = diagnosis
 
     # 渲染报告

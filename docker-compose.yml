@@ -73,6 +73,7 @@ services:
       MITMPROXY_URL: http://mitmproxy:8080
       CRAWLERGO_URL: http://crawlergo:7777
       POC_SANDBOX_URL: http://poc-sandbox:9090
+      KATANA_URL: http://katana:7778
       SIDECAR_SECRET: ${SIDECAR_SECRET:-}
       PROXY_FLOWS_CHANNEL: "proxy:flows"
       DEBUG: ${DEBUG:-false}
@@ -162,6 +163,26 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+    networks:
+      - sidecar-net
+
+  # Katana 爬虫 Sidecar — 快速端点枚举 + JS API 发现
+  katana:
+    build:
+      context: ./katana
+      dockerfile: Dockerfile
+    container_name: argus-katana
+    restart: unless-stopped
+    expose:
+      - "7778"
+    environment:
+      LISTEN_ADDR: "0.0.0.0:7778"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7778/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
     networks:
       - sidecar-net
 
