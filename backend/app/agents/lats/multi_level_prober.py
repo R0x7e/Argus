@@ -147,7 +147,7 @@ _HOST_PARAM_KEYWORDS = ("ip", "ipaddress", "host", "addr", "ping", "target", "se
 # ──── P1: 无参端点参数回退映射 ────
 _PARAM_FALLBACK_BY_VULN_TYPE: dict[str, list[str]] = {
     "sql_injection": ["id", "q", "query", "search", "name", "username", "uid"],
-    "rce": ["cmd", "exec", "command", "ping", "ip", "host"],
+    "rce": ["cmd", "exec", "command", "ping", "ip", "host", "ipaddress"],
     "xss": ["q", "search", "name", "message", "comment", "input", "text"],
     "lfi": ["file", "path", "page", "include", "filename"],
     "path_traversal": ["file", "path", "dir", "folder", "download"],

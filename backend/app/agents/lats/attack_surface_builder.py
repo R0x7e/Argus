@@ -292,11 +292,19 @@ async def build_attack_surface(
     # ── Step 3: P0 分类 + 评分 ──
     for path, ep in merged.items():
         cat = _classify_link(path)
+        ep["category"] = cat
         ep["score"] = max(
             ep.get("priority", 0),
             _score_link(path, cat)
         )
 
+    # Step 3.5: 防御性回退 — 确保所有端点都有 category
+    for path, ep in merged.items():
+        if "category" not in ep:
+            cat = _classify_link(path)
+            ep["category"] = cat
+            ep["score"] = max(ep.get("score", 0), _score_link(path, cat))
+            logger.warning("防御性回退分类: %s → %s", path, cat)
     # ── Step 4: 按 score 排序 ──
     sorted_eps = sorted(merged.values(), key=lambda x: x.get("score", 0), reverse=True)
 
@@ -377,6 +385,14 @@ async def build_attack_surface(
         "total_links": recon_results.get("homepage_info", {}).get("total_links", 0),
     }
 
+
+    # 防御性断言: vuln_pages 为 0 但 categorized_links 有数据时警告
+    vuln_in_categorized = len(categorized.get("vuln_page", []))
+    if surface.vuln_pages == 0 and vuln_in_categorized > 0:
+        logger.error(
+            "BUG: categorized_links has %d vuln_page items but surface.vuln_pages=0. "
+            "Step 3 可能未设置 ep['category']", vuln_in_categorized
+        )
     logger.info(
         "AttackSurface built: %d validated, %d vuln, %d auth, %d config, "
         "skipped: %d forbidden, %d not_found",

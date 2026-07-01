@@ -280,7 +280,7 @@ async def lats_recon_node(state: dict) -> dict:
         all_merged = list(existing_links)
         from app.agents.nodes.orchestrator import _classify_and_score_links
         merged_categorized = _classify_and_score_links(all_merged)
-        homepage["categorized_links"] = {cat: items[:15] for cat, items in merged_categorized.items()}
+        homepage["categorized_links"] = {cat: items[:60] for cat, items in merged_categorized.items()}
         scored = []
         for cat_items in merged_categorized.values():
             scored.extend(cat_items)
@@ -728,7 +728,7 @@ async def lats_init_tree_node(state: dict) -> dict:
             if path and path not in paths_to_validate:
                 paths_to_validate.add(path)
         # 限制预验证数量
-        paths_list = list(paths_to_validate)[:30]
+        paths_list = list(paths_to_validate)[:60]
         if paths_list:
             logger.info("P1: 预验证 %d 个端点...", len(paths_list))
             import asyncio as _asyncio_pre
@@ -915,7 +915,10 @@ async def lats_init_tree_node(state: dict) -> dict:
         # 仅对 dir_scan/crawled_page 来源的端点仍要求预验证通过。
         if accessibility == "unknown" and source in ("target_url", "form",
                                                        "page_extraction", "playwright",
-                                                       "http_fallback"):
+                                                       "http_fallback",
+                                                       "link_vuln_page", "link_api_endpoint",
+                                                       "link_auth_page", "link_dynamic_page",
+                                                       "link_form_handler"):
             accessibility = "accessible"
             try:
                 await emit(task_id, "lats_init", "capability_fallback_used", {
@@ -925,10 +928,19 @@ async def lats_init_tree_node(state: dict) -> dict:
             except Exception:
                 pass
         allowed_vulns = _get_allowed_vuln_types(accessibility, is_config, path)
-        # allowed_vulns 为 [] 表示完全跳过此端点
+        # 瓶颈二修复: vuln_page 端点预验证失败时也不完全跳过
         if allowed_vulns is not None and len(allowed_vulns) == 0:
-            logger.debug("P1: 跳过端点 %s (accessibility=%s)", path, accessibility)
-            continue
+            is_vuln_page = any(
+                ep.get("category") == "vuln_page" and ep.get("path") == path
+                for ep in attack_surface.get("endpoints", [])
+                if isinstance(ep, dict)
+            )
+            if is_vuln_page:
+                allowed_vulns = ["info_disclosure"]
+                logger.debug("P1: vuln_page 端点探测失败但保留: %s", path)
+            else:
+                logger.debug("P1: 跳过端点 %s (accessibility=%s)", path, accessibility)
+                continue
 
         # P1: 默认的 endpoint_metadata
         # L2/PR-3: 携带 http_method + form_fields 供 Level0 探针使用
@@ -941,7 +953,9 @@ async def lats_init_tree_node(state: dict) -> dict:
         }
 
         if not params:
-            default_vulns = ["info_disclosure", "auth_bypass"]
+            # 瓶颈一修复: 用路径语义推断替代硬编码 default_vulns
+            path_inferred = _infer_vuln_from_path(path)
+            default_vulns = path_inferred
             # P1: 如果有 allowed_vulns 且不为 None, 过滤
             if allowed_vulns is not None:
                 default_vulns = [vt for vt in default_vulns if vt in allowed_vulns]
@@ -993,6 +1007,9 @@ async def lats_init_tree_node(state: dict) -> dict:
                     value = estimate_branch_value_v2(vtype, param_name, cap, source, focus_vuln_types)
                 else:
                     value = estimate_branch_value(vtype, param_name, path, tech_stack, source, focus_vuln_types)
+                # P2: P3 hints 参数加成 — 表单/爬取来源的参数比通用回退更可靠
+                if source in ("form", "page_extraction", "playwright", "crawl"):
+                    value += 0.08
                 value += _random.uniform(-0.05, 0.05)
                 value = max(0.05, min(1.0, value))
                 child = tree.create_child_node(
@@ -1037,6 +1054,9 @@ async def lats_init_tree_node(state: dict) -> dict:
         path = endpoint_data if isinstance(endpoint_data, str) else endpoint_data.get("path", "")
         if not path or path.startswith("http://127"):
             path = target_path or "/"
+        # 瓶颈一修复: 跳过首页 — 无注入点
+        if path in ("/", ""):
+            continue
         # v9: 仅为可注入端点创建 RCE/LFI/SQLi 分支
         if not _is_endpoint_injectable(path):
             continue

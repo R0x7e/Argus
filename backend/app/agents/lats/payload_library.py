@@ -182,6 +182,16 @@ ALL_PRESETS: dict[str, dict] = {
 
 def get_payloads(vuln_type: str, preset: str = "quick_scan") -> list[str]:
     """获取指定漏洞类型和预设的 payload 列表"""
+    # v27: quick_scan 优先使用统一框架的分阶段载荷
+    if preset == "quick_scan":
+        try:
+            from .vuln_detection_framework import get_staged_payloads
+            staged = get_staged_payloads(vuln_type)
+            if staged:
+                return staged
+        except ImportError:
+            pass
+    # 回退到原来定义
     category = ALL_PRESETS.get(vuln_type, {})
     items = category.get(preset, category.get("quick_scan", []))
     return [item["payload"] for item in items]

@@ -267,14 +267,21 @@ class SearchTree:
         accessibility = self._accessibility_score(node)
         # v14: 任务目标对齐 — focus bonus
         focus_bonus = self.FOCUS_BONUS if (self.focus_vuln_types and node.state.vuln_type in self.focus_vuln_types) else 0.0
-        # v17: vuln_type 失败惩罚
+        # 瓶颈三修复: 永久 vuln_type 严重度偏置
+        _SEV_BONUS = {
+            "rce": 0.15, "sql_injection": 0.12, "ssrf": 0.10,
+            "file_upload": 0.08, "ssti": 0.08, "lfi": 0.06,
+            "path_traversal": 0.06, "idor": 0.04, "xss": 0.03,
+            "open_redirect": 0.02, "auth_bypass": 0.01, "info_disclosure": 0.0,
+        }
+        severity_bonus = _SEV_BONUS.get(node.state.vuln_type, 0.0)
         vuln_penalty = 0.0
         if knowledge and hasattr(knowledge, 'get_vuln_type_penalty'):
             vuln_penalty = knowledge.get_vuln_type_penalty(node.state.vuln_type)
         if node.visit_count == 0:
-            return (alpha_val * exploitation + gamma_val * prior + self.DIVERSITY_WEIGHT * diversity + self.RECENCY_WEIGHT * recency + self.KNOWLEDGE_WEIGHT * knowledge_score + focus_bonus - vuln_penalty) * accessibility
+            return (alpha_val * exploitation + gamma_val * prior + self.DIVERSITY_WEIGHT * diversity + self.RECENCY_WEIGHT * recency + self.KNOWLEDGE_WEIGHT * knowledge_score + focus_bonus + severity_bonus - vuln_penalty) * accessibility
         freshness = 1.0 / (1.0 + 0.01 * (s - node.last_visit_step))
-        return (alpha_val * exploitation + beta_val * exploration + gamma_val * prior + self.DIVERSITY_WEIGHT * diversity + self.RECENCY_WEIGHT * recency + self.KNOWLEDGE_WEIGHT * knowledge_score + focus_bonus - vuln_penalty) * freshness * accessibility
+        return (alpha_val * exploitation + beta_val * exploration + gamma_val * prior + self.DIVERSITY_WEIGHT * diversity + self.RECENCY_WEIGHT * recency + self.KNOWLEDGE_WEIGHT * knowledge_score + focus_bonus + severity_bonus - vuln_penalty) * freshness * accessibility
 
     def _is_too_similar(self, node: SearchNode, selected: list[SearchNode]) -> bool:
         for sel in selected:
@@ -304,19 +311,30 @@ class SearchTree:
             return []
         # v5: Cold start with endpoint diversity
         if current_cycle <= cold_start_until_cycle:
-            candidates.sort(key=lambda n: n.value_estimate, reverse=True)
+            # 瓶颈三修复: cold start 按 vuln_type 严重度优先
+            _VULN_TYPE_SEVERITY = {
+                "rce": 1.0, "sql_injection": 0.9, "ssrf": 0.85, "file_upload": 0.8,
+                "ssti": 0.8, "lfi": 0.7, "path_traversal": 0.7, "idor": 0.6,
+                "xss": 0.5, "open_redirect": 0.4, "auth_bypass": 0.35, "info_disclosure": 0.3,
+            }
+            def _cold_start_key(n):
+                severity = _VULN_TYPE_SEVERITY.get(n.state.vuln_type, 0.3)
+                return (severity, n.value_estimate)
+            candidates.sort(key=_cold_start_key, reverse=True)
             selected = []
             seen_eps = set()
+            _ep_prefix_counts: dict[str, int] = {}
             for n in candidates:
                 if len(selected) >= batch_size:
                     break
-                # v5: 冷启动多样性 — 跳过与已选节点 endpoint 前缀重叠的
+                # 瓶颈二修复: per_prefix=3 替代 1 — 每个目录前缀允许最多3个端点
                 ep_prefix = n.state.current_endpoint.rsplit("/", 1)[0] if n.state.current_endpoint else ""
-                if ep_prefix and ep_prefix in seen_eps:
-                    continue
-                selected.append(n)
                 if ep_prefix:
-                    seen_eps.add(ep_prefix)
+                    count = _ep_prefix_counts.get(ep_prefix, 0)
+                    if count >= 3:
+                        continue
+                    _ep_prefix_counts[ep_prefix] = count + 1
+                selected.append(n)
             if not selected:
                 selected = [n for n in candidates if n.status == NodeStatus.SEED][:batch_size]
             # v20-fix: 如果多样性过滤后只选出了1个但有多个候选(vuln_type不同), 回退到按vuln_type多样性选取

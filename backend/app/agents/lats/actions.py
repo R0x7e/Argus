@@ -414,9 +414,38 @@ def _has_sleep_payload(payload: str) -> bool:
 def _detect_vuln_indicators(obs: Observation, payload: str, body: str, status: int, headers: dict, time_ms: int, state: Any = None,
                              baseline_body: str = "", baseline_len: int = 0,
                              baseline_status: int = 0, baseline_time_ms: int = 0):
-    """检测各类漏洞确认指标 (v21: 两层架构 — Layer1类型特定 + Layer2 BlindVerifier)"""
+    """检测各类漏洞确认指标 (v27: 统一框架 + Layer2 BlindVerifier)"""
     body_lower = body.lower()
     detected_type = None
+
+    # v27: 优先使用统一检测框架
+    vuln_type = getattr(state, 'vuln_type', '') if state else ''
+    if vuln_type:
+        try:
+            from .vuln_detection_framework import detect_signal
+            signal = detect_signal(
+                payload, body, time_ms, status, headers,
+                baseline_body, baseline_len, baseline_status, baseline_time_ms,
+                vuln_type,
+            )
+            if signal["level"] == "confirmed":
+                obs.vuln_confirmed = True
+                severity_map = {
+                    "rce": "critical", "sql_injection": "high", "ssrf": "high",
+                    "lfi": "high", "ssti": "high", "file_upload": "high",
+                    "xss": "medium", "idor": "medium", "open_redirect": "medium",
+                    "auth_bypass": "high", "info_disclosure": "medium",
+                }
+                obs.severity = severity_map.get(vuln_type, "high")
+                obs.finding = {"type": vuln_type, "evidence": f"[{signal['method']}] {signal['evidence']}", "payload": payload}
+                obs.new_facts.append(f"{vuln_type.upper()} 确认 ({signal['method']}): {signal['evidence']}")
+                detected_type = vuln_type
+            elif signal["level"] == "weak":
+                # 微弱信号: 记录但不确认
+                obs.new_facts.append(f"微弱信号 ({signal['method']}): {signal['evidence']}")
+                obs.new_info_gained = True
+        except ImportError:
+            pass
 
     # LFI/Path Traversal
     lfi_indicators = ["root:", "/bin/bash", "/bin/sh", "daemon:", "nobody:", "[boot loader]", "[extensions]"]

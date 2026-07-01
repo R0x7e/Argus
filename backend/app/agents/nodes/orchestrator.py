@@ -534,7 +534,7 @@ async def _run_reconnaissance(state: VulnHuntState) -> dict:
         "body_preview": body[:3000] if body else "",
         "smart_snippets": smart_snippets,
         "links": top_scored_paths[:50],
-        "categorized_links": {cat: items[:15] for cat, items in categorized.items()},
+        "categorized_links": {cat: items[:60] for cat, items in categorized.items()},
         "total_links": len(all_links),
         "forms_count": len(all_forms),
         "params_count": len(all_params),

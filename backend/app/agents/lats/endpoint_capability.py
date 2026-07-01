@@ -379,7 +379,8 @@ VULN_TYPE_REQUIREMENTS: dict[str, dict] = {
         "forbidden_on": ["is_config_path", "is_version_control",
                          "is_static_asset", "is_directory_listing"],
         "endpoint_hints": ["exec", "cmd", "ping", "shell", "run", "eval", "rce"],
-        "param_hints": ["cmd", "exec", "command", "ping", "ip", "host", "addr"],
+        "param_hints": ["cmd", "exec", "command", "ping", "ip", "host", "addr",
+                        "ipaddress", "address", "target", "input", "arg"],
     },
     "sql_injection": {
         "base_value": 0.8,
